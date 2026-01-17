@@ -11,8 +11,24 @@ BIN    := dvfs_latency_bench
 OBJDIR := build/$(BUILD)
 
 STD := -std=c++17
-INCLUDES := -I. -Iworkload
 ARCH := -arch=sm_$(SM)
+
+# Project includes
+INCLUDES := -I. -Iworkload
+
+# NVML include/lib (can be overridden from command line)
+# Your machine:
+#   nvml.h at /usr/local/cuda-12.8/targets/x86_64-linux/include/nvml.h
+NVML_INC ?= /usr/local/cuda-12.8/targets/x86_64-linux/include
+NVML_LIB ?=
+
+INCLUDES += -I$(NVML_INC)
+
+# If NVML_LIB is set, add -L...
+LDFLAGS :=
+ifneq ($(NVML_LIB),)
+  LDFLAGS += -L$(NVML_LIB)
+endif
 
 ifeq ($(BUILD),debug)
   OPT_CXX  := -O0 -g
@@ -31,14 +47,13 @@ LDLIBS  := -lnvidia-ml
 
 # ---------- Sources ----------
 SRC_MAIN := main.cc
-SRC_CU   := workload/workload_compute.cu workload/workload_comm.cu
 
 OBJ_MAIN := $(OBJDIR)/main.o
 OBJ_CU   := $(OBJDIR)/workload_compute.o $(OBJDIR)/workload_comm.o
 OBJS     := $(OBJ_MAIN) $(OBJ_CU)
 
 # ---------- Rules ----------
-.PHONY: dvfs_latency_bench all clean distclean list
+.PHONY: all clean distclean list workload_objs
 
 all: dvfs_latency_bench
 
@@ -49,8 +64,9 @@ list:
 	@echo "BIN=$(BIN)"
 	@echo "NVCC=$(NVCC)"
 	@echo "CXX=$(CXX)"
+	@echo "NVML_INC=$(NVML_INC)"
+	@echo "NVML_LIB=$(NVML_LIB)"
 
-# Directory rule: ONLY create directory, no compilation here.
 $(OBJDIR):
 	@mkdir -p $@
 
@@ -66,9 +82,12 @@ $(OBJDIR)/workload_compute.o: workload/workload_compute.cu workload/workload_com
 $(OBJDIR)/workload_comm.o: workload/workload_comm.cu workload/workload_comm.h | $(OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
+workload_objs: $(OBJ_CU)
+	@echo "Built workload objects: $(OBJ_CU)"
+
 # link
 dvfs_latency_bench: $(OBJS)
-	$(NVCC) $(ARCH) $(STD) $(OPT_NVCC) -o $(BIN) $(OBJS) $(PTHREAD) $(LDLIBS)
+	$(NVCC) $(ARCH) $(STD) $(OPT_NVCC) -o $(BIN) $(OBJS) $(PTHREAD) $(LDFLAGS) $(LDLIBS)
 	@echo "Built: ./$(BIN)"
 
 clean:
