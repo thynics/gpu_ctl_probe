@@ -1,41 +1,41 @@
 // main.cc
-// DVFS latency benchmark (V100 target) - mode: idle / compute / comm
+// DVFS latency benchmark (GPU graphics clock only; mem locked NOT_SUPPORTED on this platform)
+//
+// What we control:
+//   - GPU "graphics" clock (NVML_CLOCK_GRAPHICS), via:
+//       * locked GPU clocks: nvmlDeviceSetGpuLockedClocks(min=max=target)
+//       * applications clocks: nvmlDeviceSetApplicationsClocks(mem_fixed, gpu_target)
+//     (mem_fixed is kept constant; we do NOT change mem clock)
+//
+// What we measure:
+//   - API latency: time spent in the NVML set-call(s)
+//   - Settle latency: time from before set-call to N consecutive polls reaching target
+//   - Workload intensity metrics (NVML, averaged over a window):
+//       * utilization.gpu (%), utilization.memory (%)
+//       * PCIe TX/RX throughput (KB/s)
+//       * power (mW), energy (mJ)
 //
 // Notes:
-//   - Supports LockedClocks (nvmlDeviceSetGpuLockedClocks / nvmlDeviceSetMemoryLockedClocks)
-//   - Supports ApplicationsClocks (nvmlDeviceSetApplicationsClocks)
-//   - Measures API latency + settle latency by polling (locked: clockinfo, app: applications clock)
-//   - Workload is optional (idle = no workload).
-//
-// Key fixes vs your version:
-//   1) Explicitly label which NVML set-call failed (mem/gpu/app) -> CSV status is informative.
-//   2) Add --api auto|locked|app. auto tries locked first; on NOT_SUPPORTED falls back to app.
-//   3) Each iteration performs a REAL transition (force back to `from` before measuring `to`).
-//   4) In app-clock mode, settle uses nvmlDeviceGetApplicationsClock to avoid boost mismatch.
-//
-//
+//   - This version intentionally drops *any* mem DVFS knob.
+//   - "comm" still matters as an activity profile (copy engines + PCIe) that can affect DVFS behavior.
 
-#include <cmath>
 #include <nvml.h>
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
-#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime.h>
-
-#include "workload.h"  // from your unified workload interface
+#include "workload.h"
 
 // -----------------------------
 // Helpers
@@ -50,9 +50,12 @@ static inline void sleep_us(int us) {
   std::this_thread::sleep_for(std::chrono::microseconds(us));
 }
 
-static std::string nvml_err(nvmlReturn_t r) {
-  return std::string(nvmlErrorString(r));
+static inline void sleep_ms(int ms) {
+  if (ms <= 0) return;
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
+
+static std::string nvml_err(nvmlReturn_t r) { return std::string(nvmlErrorString(r)); }
 
 #define NVML_CHECK(call) do { \
   nvmlReturn_t _r = (call); \
@@ -63,40 +66,6 @@ static std::string nvml_err(nvmlReturn_t r) {
 } while(0)
 
 static bool nvml_ok(nvmlReturn_t r) { return r == NVML_SUCCESS; }
-
-static std::vector<unsigned int> sort_unique(std::vector<unsigned int> v) {
-  std::sort(v.begin(), v.end());
-  v.erase(std::unique(v.begin(), v.end()), v.end());
-  return v;
-}
-
-static std::vector<unsigned int> pick_evenly(const std::vector<unsigned int>& sorted_asc, int k) {
-  std::vector<unsigned int> out;
-  if (sorted_asc.empty() || k <= 0) return out;
-  if ((int)sorted_asc.size() <= k) return sorted_asc;
-  out.reserve(k);
-  for (int i = 0; i < k; ++i) {
-    double t = (k == 1) ? 0.0 : (double)i / (double)(k - 1);
-    size_t idx = (size_t)std::llround(t * (double)(sorted_asc.size() - 1));
-    out.push_back(sorted_asc[idx]);
-  }
-  return sort_unique(out);
-}
-
-static std::vector<unsigned int> parse_u32_list_csv(const std::string& s) {
-  std::vector<unsigned int> v;
-  std::stringstream ss(s);
-  std::string tok;
-  while (std::getline(ss, tok, ',')) {
-    if (tok.empty()) continue;
-    char* end = nullptr;
-    long long x = std::strtoll(tok.c_str(), &end, 10);
-    if (end == tok.c_str()) continue;
-    if (x < 0) continue;
-    v.push_back((unsigned int)x);
-  }
-  return sort_unique(v);
-}
 
 static bool has_arg(int argc, char** argv, const char* key) {
   for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], key) == 0) return true;
@@ -135,32 +104,69 @@ static bool get_arg_bool(int argc, char** argv, const char* key, bool def) {
   return def;
 }
 
+static std::vector<unsigned int> sort_unique(std::vector<unsigned int> v) {
+  std::sort(v.begin(), v.end());
+  v.erase(std::unique(v.begin(), v.end()), v.end());
+  return v;
+}
+
+static std::vector<unsigned int> pick_evenly(const std::vector<unsigned int>& sorted_asc, int k) {
+  std::vector<unsigned int> out;
+  if (sorted_asc.empty() || k <= 0) return out;
+  if ((int)sorted_asc.size() <= k) return sorted_asc;
+  out.reserve(k);
+  for (int i = 0; i < k; ++i) {
+    double t = (k == 1) ? 0.0 : (double)i / (double)(k - 1);
+    size_t idx = (size_t)std::llround(t * (double)(sorted_asc.size() - 1));
+    out.push_back(sorted_asc[idx]);
+  }
+  return sort_unique(out);
+}
+
+static std::vector<unsigned int> parse_u32_list_csv(const std::string& s) {
+  std::vector<unsigned int> v;
+  std::stringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (tok.empty()) continue;
+    char* end = nullptr;
+    long long x = std::strtoll(tok.c_str(), &end, 10);
+    if (end == tok.c_str()) continue;
+    if (x < 0) continue;
+    v.push_back((unsigned int)x);
+  }
+  return sort_unique(v);
+}
+
 static void print_usage() {
   std::fprintf(stderr,
     "Usage: dvfs_latency_bench [options]\n"
     "  --device N               GPU index (default 0)\n"
     "  --mode idle|compute|comm (default idle)\n"
-    "  --out file.csv           output CSV (default dvfs_latency.csv)\n"
-    "  --iters N                datapoints per transition (default 200)\n"
-    "  --poll_us U              poll interval for settle check (default 2000)\n"
-    "  --stable_n N             require N consecutive polls at target (default 5)\n"
-    "  --timeout_ms T           settle timeout per transition (default 2000ms)\n"
-    "  --warmup_trans N         warmup transitions (default 20)\n"
-    "  --warmup_ms M            warmup time before measuring (default 1000ms)\n"
+    "  --out file.csv           output CSV (default dvfs_latency_gpu_only.csv)\n"
     "\n"
-    "DVFS point selection:\n"
+    "Clock points (GPU graphics clock only):\n"
     "  --core_list a,b,c        explicit graphics clocks MHz (optional)\n"
-    "  --mem_list  a,b,c        explicit memory clocks MHz (optional)\n"
-    "  --pick_core K            if no core_list, pick K points evenly (default 4)\n"
-    "  --pick_mem  K            if no mem_list,  pick K points evenly (default 3)\n"
+    "  --pick_core K            if no core_list, pick K points evenly (default 6)\n"
     "  --transitions adjacent|extreme|all (default adjacent)\n"
-    "  --order mem_then_gpu|gpu_then_mem (default mem_then_gpu)\n"
-    "  --smi_csv PATH           fallback supported clocks CSV (default supported_clocks.csv)\n"
-    "                          (format: mem, gr  e.g. \"877, 1530\")\n"
     "\n"
     "Clock API selection:\n"
     "  --api auto|locked|app    (default auto)\n"
-    "    auto: try locked first; if NOT_SUPPORTED fallback to applications clocks.\n"
+    "    locked: nvmlDeviceSetGpuLockedClocks\n"
+    "    app   : nvmlDeviceSetApplicationsClocks(mem_fixed, gpu_target)  (mem_fixed constant)\n"
+    "    auto  : prefer locked; fallback to app if locked not usable\n"
+    "\n"
+    "Timing (defaults are intentionally longer for credibility):\n"
+    "  --iters N                datapoints per transition (default 300)\n"
+    "  --poll_us U              settle poll interval (default 2000)\n"
+    "  --stable_n N             require N consecutive polls at target (default 10)\n"
+    "  --timeout_ms T           settle timeout per transition (default 8000)\n"
+    "  --warmup_trans N         warmup transitions (default 100)\n"
+    "  --warmup_ms M            warmup sleep before measuring (default 10000)\n"
+    "\n"
+    "Load intensity metrics (NVML averaged):\n"
+    "  --metric_window_ms W     window for averaging util/pcie (default 200)\n"
+    "  --metric_interval_ms I   sampling interval inside window (default 50)\n"
     "\n"
     "Compute workload options (mode=compute):\n"
     "  --compute_kind compute|mem|mixed (default compute)\n"
@@ -203,14 +209,26 @@ static NvmlCtx nvml_open_device(int device_id) {
 
   char name[128];
   std::memset(name, 0, sizeof(name));
-  NVML_CHECK(nvmlDeviceGetName(dev, name, sizeof(name)-1));
+  NVML_CHECK(nvmlDeviceGetName(dev, name, sizeof(name) - 1));
   c.name = name;
 
   return c;
 }
 
-static void nvml_close() {
-  nvmlShutdown();
+static void nvml_close() { nvmlShutdown(); }
+
+static std::optional<unsigned int> nvml_get_clock_mhz(nvmlDevice_t dev, nvmlClockType_t t) {
+  unsigned int mhz = 0;
+  nvmlReturn_t r = nvmlDeviceGetClockInfo(dev, t, &mhz);
+  if (!nvml_ok(r)) return std::nullopt;
+  return mhz;
+}
+
+static std::optional<unsigned int> nvml_get_app_clock_mhz(nvmlDevice_t dev, nvmlClockType_t t) {
+  unsigned int mhz = 0;
+  nvmlReturn_t r = nvmlDeviceGetApplicationsClock(dev, t, &mhz);
+  if (!nvml_ok(r)) return std::nullopt;
+  return mhz;
 }
 
 static std::optional<unsigned int> nvml_get_power_mw(nvmlDevice_t dev) {
@@ -228,119 +246,89 @@ static std::optional<unsigned long long> nvml_get_energy_mj(nvmlDevice_t dev) {
   return mj;
 }
 
-static std::optional<unsigned int> nvml_get_clock_mhz(nvmlDevice_t dev, nvmlClockType_t t) {
-  unsigned int mhz = 0;
-  nvmlReturn_t r = nvmlDeviceGetClockInfo(dev, t, &mhz);
-  if (!nvml_ok(r)) return std::nullopt;
-  return mhz;
-}
-
-static std::optional<unsigned int> nvml_get_app_clock_mhz(nvmlDevice_t dev, nvmlClockType_t t) {
-  unsigned int mhz = 0;
-  nvmlReturn_t r = nvmlDeviceGetApplicationsClock(dev, t, &mhz);
-  if (!nvml_ok(r)) return std::nullopt;
-  return mhz;
-}
-
-// Robust supported-clocks query (avoid nullptr probe).
 static std::vector<unsigned int> nvml_get_supported_mem_clocks(nvmlDevice_t dev) {
-  unsigned int n = 64;
+  unsigned int n = 256;
   std::vector<unsigned int> mem(n);
-
   nvmlReturn_t r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
   if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
     mem.resize(n);
     r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
   }
-
-  if (!nvml_ok(r) || n == 0) {
-    n = 256;
-    mem.assign(n, 0);
-    r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
-    if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
-      mem.resize(n);
-      r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
-    }
-  }
-
   if (!nvml_ok(r) || n == 0) return {};
   mem.resize(n);
   return sort_unique(mem);
 }
 
 static std::vector<unsigned int> nvml_get_supported_graphics_clocks(nvmlDevice_t dev, unsigned int mem_mhz) {
-  unsigned int n = 128;
+  unsigned int n = 512;
   std::vector<unsigned int> gr(n);
-
   nvmlReturn_t r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
   if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
     gr.resize(n);
     r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
   }
-
-  if (!nvml_ok(r) || n == 0) {
-    n = 512;
-    gr.assign(n, 0);
-    r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
-    if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
-      gr.resize(n);
-      r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
-    }
-  }
-
   if (!nvml_ok(r) || n == 0) return {};
   gr.resize(n);
   return sort_unique(gr);
 }
 
-struct SetClockOrder {
-  enum Kind { MemThenGpu, GpuThenMem } kind = MemThenGpu;
+struct Metrics {
+  double gpu_util_pct = 0.0;
+  double mem_util_pct = 0.0;
+  double pcie_tx_kbps = 0.0;
+  double pcie_rx_kbps = 0.0;
 };
 
-struct SetClockApiLatencyUs {
-  uint64_t mem_us = 0;     // locked only
-  uint64_t gpu_us = 0;     // locked only
-  uint64_t total_us = 0;   // locked: sum wall time, app: one call wall time
-};
+static std::optional<Metrics> sample_metrics_avg(nvmlDevice_t dev, int window_ms, int interval_ms) {
+  window_ms = std::max(0, window_ms);
+  interval_ms = std::max(1, interval_ms);
+  if (window_ms == 0) {
+    Metrics m{};
+    nvmlUtilization_t util{};
+    unsigned int tx = 0, rx = 0;
 
-static nvmlReturn_t set_locked_mem(nvmlDevice_t dev, unsigned int mem_mhz, uint64_t* api_us) {
-  uint64_t t0 = now_us();
-  nvmlReturn_t r = nvmlDeviceSetMemoryLockedClocks(dev, mem_mhz, mem_mhz);
-  uint64_t t1 = now_us();
-  if (api_us) *api_us = (t1 - t0);
-  return r;
+    if (nvml_ok(nvmlDeviceGetUtilizationRates(dev, &util))) {
+      m.gpu_util_pct = util.gpu;
+      m.mem_util_pct = util.memory;
+    }
+    if (nvml_ok(nvmlDeviceGetPcieThroughput(dev, NVML_PCIE_UTIL_TX_BYTES, &tx))) m.pcie_tx_kbps = tx;
+    if (nvml_ok(nvmlDeviceGetPcieThroughput(dev, NVML_PCIE_UTIL_RX_BYTES, &rx))) m.pcie_rx_kbps = rx;
+    return m;
+  }
+
+  int samples = 0;
+  double sum_gpu = 0, sum_mem = 0, sum_tx = 0, sum_rx = 0;
+
+  uint64_t t_end = now_us() + (uint64_t)window_ms * 1000ull;
+  while (now_us() < t_end) {
+    nvmlUtilization_t util{};
+    unsigned int tx = 0, rx = 0;
+
+    if (nvml_ok(nvmlDeviceGetUtilizationRates(dev, &util))) {
+      sum_gpu += util.gpu;
+      sum_mem += util.memory;
+    }
+    if (nvml_ok(nvmlDeviceGetPcieThroughput(dev, NVML_PCIE_UTIL_TX_BYTES, &tx))) sum_tx += tx;
+    if (nvml_ok(nvmlDeviceGetPcieThroughput(dev, NVML_PCIE_UTIL_RX_BYTES, &rx))) sum_rx += rx;
+
+    samples++;
+    sleep_ms(interval_ms);
+  }
+
+  if (samples <= 0) return std::nullopt;
+
+  Metrics m{};
+  m.gpu_util_pct = sum_gpu / samples;
+  m.mem_util_pct = sum_mem / samples;
+  m.pcie_tx_kbps = sum_tx / samples;
+  m.pcie_rx_kbps = sum_rx / samples;
+  return m;
 }
 
-static nvmlReturn_t set_locked_gpu(nvmlDevice_t dev, unsigned int gpu_mhz, uint64_t* api_us) {
-  uint64_t t0 = now_us();
-  nvmlReturn_t r = nvmlDeviceSetGpuLockedClocks(dev, gpu_mhz, gpu_mhz);
-  uint64_t t1 = now_us();
-  if (api_us) *api_us = (t1 - t0);
-  return r;
-}
-
-static nvmlReturn_t set_app_clocks(nvmlDevice_t dev, unsigned int mem_mhz, unsigned int gpu_mhz, uint64_t* api_us) {
-  uint64_t t0 = now_us();
-  nvmlReturn_t r = nvmlDeviceSetApplicationsClocks(dev, mem_mhz, gpu_mhz);
-  uint64_t t1 = now_us();
-  if (api_us) *api_us = (t1 - t0);
-  return r;
-}
-
-static void reset_locked_clocks(nvmlDevice_t dev) {
-  nvmlDeviceResetGpuLockedClocks(dev);
-  nvmlDeviceResetMemoryLockedClocks(dev);
-}
-
-static void reset_app_clocks(nvmlDevice_t dev) {
-  nvmlDeviceResetApplicationsClocks(dev);
-}
-
-enum class ClockApiKind : int {
-  Auto = 0,
-  Locked = 1,
-  App = 2,
-};
+// -----------------------------
+// Clock API (GPU-only control)
+// -----------------------------
+enum class ClockApiKind : int { Auto = 0, Locked = 1, App = 2 };
 
 static ClockApiKind parse_api_kind(const std::string& s) {
   if (s == "locked") return ClockApiKind::Locked;
@@ -356,334 +344,156 @@ static const char* api_kind_str(ClockApiKind k) {
   }
 }
 
-struct SettleResult {
-  bool ok = false;
-  uint64_t t_total_us = 0;           // from start (before set) to stable
-  uint64_t t_after_calls_us = 0;     // from after last set call returns to stable
-  int polls = 0;
-  unsigned int final_gpu_mhz = 0;    // actual clockinfo
-  unsigned int final_mem_mhz = 0;    // actual clockinfo
-  std::string err;                  // "ok(locked)" / "set_locked_mem:Not Supported" / ...
+struct SetClockApiLatencyUs {
+  uint64_t api_us = 0;
 };
 
-// Decide settle condition:
-// - locked: require actual clockinfo == target
-// - app: require applications clock == target (more stable across boost)
-static SettleResult set_and_settle(nvmlDevice_t dev,
-                                   unsigned int target_gpu_mhz,
-                                   unsigned int target_mem_mhz,
-                                   SetClockOrder order,
-                                   int poll_us,
-                                   int stable_n,
-                                   int timeout_ms,
-                                   ClockApiKind api_kind,
-                                   SetClockApiLatencyUs* api_lat_out) {
+static nvmlReturn_t set_locked_gpu(nvmlDevice_t dev, unsigned int gpu_mhz, uint64_t* api_us) {
+  uint64_t t0 = now_us();
+  nvmlReturn_t r = nvmlDeviceSetGpuLockedClocks(dev, gpu_mhz, gpu_mhz);
+  uint64_t t1 = now_us();
+  if (api_us) *api_us = (t1 - t0);
+  return r;
+}
+
+static nvmlReturn_t set_app_gpu(nvmlDevice_t dev, unsigned int mem_fixed_mhz, unsigned int gpu_mhz, uint64_t* api_us) {
+  uint64_t t0 = now_us();
+  nvmlReturn_t r = nvmlDeviceSetApplicationsClocks(dev, mem_fixed_mhz, gpu_mhz);
+  uint64_t t1 = now_us();
+  if (api_us) *api_us = (t1 - t0);
+  return r;
+}
+
+static void reset_locked_gpu(nvmlDevice_t dev) { nvmlDeviceResetGpuLockedClocks(dev); }
+static void reset_app(nvmlDevice_t dev) { nvmlDeviceResetApplicationsClocks(dev); }
+
+struct SettleResult {
+  bool ok = false;
+  uint64_t t_total_us = 0;
+  uint64_t t_after_call_us = 0;
+  int polls = 0;
+  unsigned int final_gpu_mhz = 0;
+  std::string status; // ok(locked/app), timeout(...), set_xxx:ERR
+};
+
+static SettleResult set_and_settle_gpu_only(nvmlDevice_t dev,
+                                            unsigned int target_gpu_mhz,
+                                            unsigned int mem_fixed_mhz,
+                                            int poll_us,
+                                            int stable_n,
+                                            int timeout_ms,
+                                            ClockApiKind api_kind,
+                                            bool locked_gpu_ok,
+                                            bool app_ok,
+                                            SetClockApiLatencyUs* api_lat_out) {
   SettleResult res;
   stable_n = std::max(1, stable_n);
   poll_us  = std::max(0, poll_us);
+  timeout_ms = std::max(1, timeout_ms);
 
   uint64_t t_start = now_us();
-  uint64_t api_mem = 0, api_gpu = 0, api_one = 0;
+  uint64_t api_us = 0;
 
-  // -----------------------------
-  // Set clocks
-  // -----------------------------
-  auto do_locked = [&](std::string* which)->nvmlReturn_t {
-    if (order.kind == SetClockOrder::MemThenGpu) {
-      nvmlReturn_t r1 = set_locked_mem(dev, target_mem_mhz, &api_mem);
-      if (!nvml_ok(r1)) { if (which) *which = "set_locked_mem"; return r1; }
-      nvmlReturn_t r2 = set_locked_gpu(dev, target_gpu_mhz, &api_gpu);
-      if (!nvml_ok(r2)) { if (which) *which = "set_locked_gpu"; return r2; }
-      return NVML_SUCCESS;
-    } else {
-      nvmlReturn_t r1 = set_locked_gpu(dev, target_gpu_mhz, &api_gpu);
-      if (!nvml_ok(r1)) { if (which) *which = "set_locked_gpu"; return r1; }
-      nvmlReturn_t r2 = set_locked_mem(dev, target_mem_mhz, &api_mem);
-      if (!nvml_ok(r2)) { if (which) *which = "set_locked_mem"; return r2; }
-      return NVML_SUCCESS;
-    }
-  };
-
-  auto do_app = [&](std::string* which)->nvmlReturn_t {
-    if (which) *which = "set_app_clocks";
-    return set_app_clocks(dev, target_mem_mhz, target_gpu_mhz, &api_one);
-  };
-
+  // choose API
   ClockApiKind used = api_kind;
+  if (api_kind == ClockApiKind::Auto) {
+    used = locked_gpu_ok ? ClockApiKind::Locked : ClockApiKind::App;
+  }
+  if (used == ClockApiKind::Locked && !locked_gpu_ok) used = ClockApiKind::App;
+  if (used == ClockApiKind::App && !app_ok) used = ClockApiKind::Locked;
+
+  // set
+  nvmlReturn_t rset = NVML_SUCCESS;
   std::string which;
 
-  nvmlReturn_t rset = NVML_SUCCESS;
-
-  if (api_kind == ClockApiKind::Locked) {
-    rset = do_locked(&which);
-    used = ClockApiKind::Locked;
-  } else if (api_kind == ClockApiKind::App) {
-    rset = do_app(&which);
-    used = ClockApiKind::App;
+  if (used == ClockApiKind::Locked) {
+    which = "set_locked_gpu";
+    rset = set_locked_gpu(dev, target_gpu_mhz, &api_us);
   } else {
-    // Auto: try locked first; if NOT_SUPPORTED, fallback to app.
-    rset = do_locked(&which);
-    used = ClockApiKind::Locked;
-    if (rset == NVML_ERROR_NOT_SUPPORTED) {
-      // fallback
-      rset = do_app(&which);
-      used = ClockApiKind::App;
-    }
+    which = "set_app_gpu";
+    rset = set_app_gpu(dev, mem_fixed_mhz, target_gpu_mhz, &api_us);
   }
 
-  uint64_t t_after_calls = now_us();
+  uint64_t t_after = now_us();
 
-  if (api_lat_out) {
-    if (used == ClockApiKind::Locked) {
-      api_lat_out->mem_us = api_mem;
-      api_lat_out->gpu_us = api_gpu;
-      api_lat_out->total_us = (t_after_calls - t_start);
-    } else {
-      api_lat_out->mem_us = 0;
-      api_lat_out->gpu_us = 0;
-      api_lat_out->total_us = api_one; // one-call time
-    }
-  }
+  if (api_lat_out) api_lat_out->api_us = api_us;
 
   if (!nvml_ok(rset)) {
     res.ok = false;
-    res.err = which + ":" + nvml_err(rset);
+    res.final_gpu_mhz = nvml_get_clock_mhz(dev, NVML_CLOCK_GRAPHICS).value_or(0);
+    res.status = which + ":" + nvml_err(rset);
     return res;
   }
 
-  // -----------------------------
-  // Settle polling
-  // -----------------------------
+  // settle poll
   int consec = 0;
   int polls = 0;
   uint64_t deadline = t_start + (uint64_t)timeout_ms * 1000ull;
 
   while (true) {
-    // Always record actual clocks for final_{gpu,mem}
     auto cg_act = nvml_get_clock_mhz(dev, NVML_CLOCK_GRAPHICS);
-    auto cm_act = nvml_get_clock_mhz(dev, NVML_CLOCK_MEM);
     if (cg_act.has_value()) res.final_gpu_mhz = *cg_act;
-    if (cm_act.has_value()) res.final_mem_mhz = *cm_act;
 
     bool hit = false;
-
     if (used == ClockApiKind::Locked) {
-      if (cg_act.has_value() && cm_act.has_value() &&
-          *cg_act == target_gpu_mhz && *cm_act == target_mem_mhz) {
-        hit = true;
-      }
+      if (cg_act.has_value() && *cg_act == target_gpu_mhz) hit = true;
     } else {
-      // Applications clocks: check the configured app clocks (not the instantaneous clockinfo)
+      // app: use configured app clock to avoid boost mismatch
       auto cg_app = nvml_get_app_clock_mhz(dev, NVML_CLOCK_GRAPHICS);
-      auto cm_app = nvml_get_app_clock_mhz(dev, NVML_CLOCK_MEM);
-      if (cg_app.has_value() && cm_app.has_value() &&
-          *cg_app == target_gpu_mhz && *cm_app == target_mem_mhz) {
-        hit = true;
-      }
+      if (cg_app.has_value() && *cg_app == target_gpu_mhz) hit = true;
     }
 
     polls++;
     consec = hit ? (consec + 1) : 0;
 
-    uint64_t now = now_us();
+    uint64_t t_now = now_us();
     if (consec >= stable_n) {
       res.ok = true;
       res.polls = polls;
-      res.t_total_us = now - t_start;
-      res.t_after_calls_us = now - t_after_calls;
-      res.err = std::string("ok(") + api_kind_str(used) + ")";
+      res.t_total_us = t_now - t_start;
+      res.t_after_call_us = t_now - t_after;
+      res.status = std::string("ok(") + api_kind_str(used) + ")";
       return res;
     }
-
-    if (now >= deadline) {
+    if (t_now >= deadline) {
       res.ok = false;
       res.polls = polls;
-      res.t_total_us = now - t_start;
-      res.t_after_calls_us = now - t_after_calls;
-      res.err = std::string("timeout(") + api_kind_str(used) + ")";
+      res.t_total_us = t_now - t_start;
+      res.t_after_call_us = t_now - t_after;
+      res.status = std::string("timeout(") + api_kind_str(used) + ")";
       return res;
     }
-
     if (poll_us > 0) sleep_us(poll_us);
   }
 }
 
 // -----------------------------
-// DVFS point / supported DB
+// Transitions
 // -----------------------------
-struct DvfsPoint {
-  unsigned int gpu_mhz = 0;
-  unsigned int mem_mhz = 0;
-};
+enum class TransitionPlan : int { Adjacent = 0, Extreme = 1, AllPairs = 2 };
 
-static std::string point_str(const DvfsPoint& p) {
-  std::ostringstream os;
-  os << p.gpu_mhz << "@" << p.mem_mhz;
-  return os.str();
+static TransitionPlan parse_plan(const std::string& s) {
+  if (s == "adjacent") return TransitionPlan::Adjacent;
+  if (s == "extreme") return TransitionPlan::Extreme;
+  if (s == "all") return TransitionPlan::AllPairs;
+  return TransitionPlan::Adjacent;
 }
 
-struct SupportedDB {
-  // mem -> sorted unique graphics clocks
-  std::map<unsigned int, std::vector<unsigned int>> g_by_mem;
+static std::vector<std::pair<unsigned int, unsigned int>>
+build_transitions(const std::vector<unsigned int>& gpu_points, TransitionPlan plan) {
+  std::vector<std::pair<unsigned int, unsigned int>> out;
+  if (gpu_points.size() < 2) return out;
 
-  std::vector<unsigned int> mems() const {
-    std::vector<unsigned int> out;
-    out.reserve(g_by_mem.size());
-    for (auto& kv : g_by_mem) out.push_back(kv.first);
-    return out;
-  }
-
-  size_t size_pairs() const {
-    size_t s = 0;
-    for (auto& kv : g_by_mem) s += kv.second.size();
-    return s;
-  }
-};
-
-static SupportedDB build_db_from_nvml(nvmlDevice_t dev) {
-  SupportedDB db;
-  auto mems = nvml_get_supported_mem_clocks(dev);
-  for (auto m : mems) {
-    auto gs = nvml_get_supported_graphics_clocks(dev, m);
-    if (!gs.empty()) db.g_by_mem[m] = gs;
-  }
-  return db;
-}
-
-static bool parse_mem_gr_line(const std::string& line, unsigned int* mem, unsigned int* gr) {
-  // formats tolerated:
-  //   "877, 1530"
-  //   "877,1530"
-  //   "877 1530"
-  if (line.empty()) return false;
-  char* end = nullptr;
-  unsigned long m = std::strtoul(line.c_str(), &end, 10);
-  if (end == line.c_str()) return false;
-  while (*end && (*end == ' ' || *end == ',' || *end == '\t')) ++end;
-  if (!*end) return false;
-  unsigned long g = std::strtoul(end, nullptr, 10);
-  if (m == 0 || g == 0) return false;
-  *mem = (unsigned int)m;
-  *gr  = (unsigned int)g;
-  return true;
-}
-
-static SupportedDB build_db_from_smi_csv_file(const std::string& path) {
-  SupportedDB db;
-  std::ifstream in(path);
-  if (!in.good()) return db;
-  std::string line;
-  while (std::getline(in, line)) {
-    unsigned int mem=0, gr=0;
-    if (!parse_mem_gr_line(line, &mem, &gr)) continue;
-    db.g_by_mem[mem].push_back(gr);
-  }
-  for (auto& kv : db.g_by_mem) kv.second = sort_unique(kv.second);
-  return db;
-}
-
-static SupportedDB build_db_from_smi_popen() {
-  SupportedDB db;
-  const char* cmd = "nvidia-smi --query-supported-clocks=mem,gr --format=csv,noheader,nounits";
-  FILE* fp = popen(cmd, "r");
-  if (!fp) return db;
-
-  char buf[512];
-  while (std::fgets(buf, sizeof(buf), fp)) {
-    std::string line(buf);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-    unsigned int mem=0, gr=0;
-    if (!parse_mem_gr_line(line, &mem, &gr)) continue;
-    db.g_by_mem[mem].push_back(gr);
-  }
-  pclose(fp);
-
-  for (auto& kv : db.g_by_mem) kv.second = sort_unique(kv.second);
-  return db;
-}
-
-static std::vector<DvfsPoint> select_points_from_db(const SupportedDB& db,
-                                                    std::optional<std::vector<unsigned int>> user_core_list,
-                                                    std::optional<std::vector<unsigned int>> user_mem_list,
-                                                    int pick_core,
-                                                    int pick_mem) {
-  std::vector<unsigned int> mem_all = db.mems();
-  if (mem_all.empty()) return {};
-
-  std::vector<unsigned int> mem_sel;
-  if (user_mem_list.has_value() && !user_mem_list->empty()) {
-    mem_sel = sort_unique(*user_mem_list);
-  } else {
-    mem_sel = pick_evenly(mem_all, std::max(1, pick_mem));
-  }
-
-  std::vector<DvfsPoint> points;
-
-  for (unsigned int mem_mhz : mem_sel) {
-    auto it = db.g_by_mem.find(mem_mhz);
-    if (it == db.g_by_mem.end() || it->second.empty()) continue;
-
-    const std::vector<unsigned int>& g_all = it->second;
-    std::vector<unsigned int> g_sel;
-
-    if (user_core_list.has_value() && !user_core_list->empty()) {
-      std::vector<unsigned int> gl = sort_unique(*user_core_list);
-      for (auto g : gl) {
-        if (std::binary_search(g_all.begin(), g_all.end(), g)) g_sel.push_back(g);
-      }
-      g_sel = sort_unique(g_sel);
-      if (g_sel.empty()) {
-        g_sel = pick_evenly(g_all, std::max(1, pick_core));
-      }
-    } else {
-      g_sel = pick_evenly(g_all, std::max(1, pick_core));
-    }
-
-    for (unsigned int g : g_sel) {
-      points.push_back({g, mem_mhz});
-    }
-  }
-
-  std::sort(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
-    if (a.mem_mhz != b.mem_mhz) return a.mem_mhz < b.mem_mhz;
-    return a.gpu_mhz < b.gpu_mhz;
-  });
-  points.erase(std::unique(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
-    return a.gpu_mhz==b.gpu_mhz && a.mem_mhz==b.mem_mhz;
-  }), points.end());
-
-  return points;
-}
-
-// -----------------------------
-// Transition plan
-// -----------------------------
-enum class TransitionPlan : int {
-  Adjacent = 0,
-  Extreme  = 1,
-  AllPairs = 2,
-};
-
-static std::vector<std::pair<DvfsPoint, DvfsPoint>>
-build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
-  std::vector<std::pair<DvfsPoint, DvfsPoint>> out;
-  if (points.size() < 2) return out;
+  std::vector<unsigned int> ps = gpu_points;
+  std::sort(ps.begin(), ps.end());
+  ps = sort_unique(ps);
 
   if (plan == TransitionPlan::AllPairs) {
-    for (size_t i = 0; i < points.size(); ++i) {
-      for (size_t j = 0; j < points.size(); ++j) {
-        if (i == j) continue;
-        out.push_back({points[i], points[j]});
-      }
-    }
+    for (size_t i = 0; i < ps.size(); ++i)
+      for (size_t j = 0; j < ps.size(); ++j)
+        if (i != j) out.push_back({ps[i], ps[j]});
     return out;
   }
-
-  std::vector<DvfsPoint> ps = points;
-  std::sort(ps.begin(), ps.end(), [](const DvfsPoint& a, const DvfsPoint& b){
-    if (a.mem_mhz != b.mem_mhz) return a.mem_mhz < b.mem_mhz;
-    return a.gpu_mhz < b.gpu_mhz;
-  });
 
   if (plan == TransitionPlan::Extreme) {
     out.push_back({ps.front(), ps.back()});
@@ -691,40 +501,11 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
     return out;
   }
 
-  // Adjacent within same mem (gpu changes)
+  // Adjacent
   for (size_t i = 1; i < ps.size(); ++i) {
-    if (ps[i].mem_mhz == ps[i-1].mem_mhz) {
-      out.push_back({ps[i-1], ps[i]});
-      out.push_back({ps[i], ps[i-1]});
-    }
+    out.push_back({ps[i - 1], ps[i]});
+    out.push_back({ps[i], ps[i - 1]});
   }
-
-  // Adjacent within same gpu (mem changes)
-  for (size_t i = 0; i < ps.size(); ++i) {
-    for (size_t j = i + 1; j < ps.size(); ++j) {
-      if (ps[i].gpu_mhz == ps[j].gpu_mhz && ps[i].mem_mhz != ps[j].mem_mhz) {
-        bool adjacent = true;
-        for (size_t k = 0; k < ps.size(); ++k) {
-          if (ps[k].gpu_mhz != ps[i].gpu_mhz) continue;
-          if (ps[k].mem_mhz > ps[i].mem_mhz && ps[k].mem_mhz < ps[j].mem_mhz) { adjacent = false; break; }
-          if (ps[k].mem_mhz > ps[j].mem_mhz && ps[k].mem_mhz < ps[i].mem_mhz) { adjacent = false; break; }
-        }
-        if (adjacent) {
-          out.push_back({ps[i], ps[j]});
-          out.push_back({ps[j], ps[i]});
-        }
-      }
-    }
-  }
-
-  auto key = [](const std::pair<DvfsPoint,DvfsPoint>& e){
-    return ((uint64_t)e.first.gpu_mhz << 48) ^
-           ((uint64_t)e.first.mem_mhz << 32) ^
-           ((uint64_t)e.second.gpu_mhz << 16) ^
-           ((uint64_t)e.second.mem_mhz);
-  };
-  std::sort(out.begin(), out.end(), [&](auto& a, auto& b){ return key(a) < key(b); });
-  out.erase(std::unique(out.begin(), out.end(), [&](auto& a, auto& b){ return key(a)==key(b); }), out.end());
   return out;
 }
 
@@ -737,11 +518,11 @@ static bool file_exists(const std::string& path) {
 }
 
 static void csv_write_header(std::ofstream& of) {
-  of << "ts_us,device_id,gpu_name,mode,"
-        "from_gpu_mhz,from_mem_mhz,to_gpu_mhz,to_mem_mhz,order,"
-        "api_mem_us,api_gpu_us,api_total_us,"
-        "settle_total_us,settle_after_calls_us,polls,stable_n,poll_us,timeout_ms,"
-        "final_gpu_mhz,final_mem_mhz,"
+  of << "ts_us,device_id,gpu_name,mode,api_kind,mem_fixed_mhz,"
+        "from_gpu_mhz,to_gpu_mhz,"
+        "api_us,settle_total_us,settle_after_call_us,polls,stable_n,poll_us,timeout_ms,"
+        "final_gpu_mhz,"
+        "gpu_util_pct,mem_util_pct,pcie_tx_kbps,pcie_rx_kbps,"
         "power_mw,energy_mj,status\n";
 }
 
@@ -750,36 +531,50 @@ static void csv_write_row(std::ofstream& of,
                           int device_id,
                           const std::string& gpu_name,
                           const std::string& mode,
-                          const DvfsPoint& from,
-                          const DvfsPoint& to,
-                          const std::string& order,
+                          const std::string& api_kind,
+                          unsigned int mem_fixed_mhz,
+                          unsigned int from_gpu,
+                          unsigned int to_gpu,
                           const SetClockApiLatencyUs& api,
                           const SettleResult& settle,
                           int stable_n,
                           int poll_us,
                           int timeout_ms,
+                          const std::optional<Metrics>& met,
                           const std::optional<unsigned int>& power_mw,
                           const std::optional<unsigned long long>& energy_mj) {
   of << ts_us << ","
      << device_id << ","
      << "\"" << gpu_name << "\"" << ","
      << mode << ","
-     << from.gpu_mhz << "," << from.mem_mhz << ","
-     << to.gpu_mhz << "," << to.mem_mhz << ","
-     << order << ","
-     << api.mem_us << "," << api.gpu_us << "," << api.total_us << ","
-     << settle.t_total_us << "," << settle.t_after_calls_us << ","
-     << settle.polls << "," << stable_n << "," << poll_us << "," << timeout_ms << ","
-     << settle.final_gpu_mhz << "," << settle.final_mem_mhz << ","
-     << (power_mw.has_value() ? std::to_string(*power_mw) : "") << ","
+     << api_kind << ","
+     << mem_fixed_mhz << ","
+     << from_gpu << "," << to_gpu << ","
+     << api.api_us << ","
+     << settle.t_total_us << ","
+     << settle.t_after_call_us << ","
+     << settle.polls << ","
+     << stable_n << "," << poll_us << "," << timeout_ms << ","
+     << settle.final_gpu_mhz << ",";
+
+  if (met.has_value()) {
+    of << met->gpu_util_pct << ","
+       << met->mem_util_pct << ","
+       << met->pcie_tx_kbps << ","
+       << met->pcie_rx_kbps << ",";
+  } else {
+    of << ",,,,"; // empty
+  }
+
+  of << (power_mw.has_value() ? std::to_string(*power_mw) : "") << ","
      << (energy_mj.has_value() ? std::to_string(*energy_mj) : "") << ","
-     << settle.err
+     << settle.status
      << "\n";
   of.flush();
 }
 
 // -----------------------------
-// Workload config from CLI
+// Workload config parsing (unchanged)
 // -----------------------------
 static WorkloadMode parse_mode(const std::string& s) {
   if (s == "idle") return WorkloadMode::Idle;
@@ -810,24 +605,6 @@ static CommSyncKind parse_comm_sync(const std::string& s) {
   return CommSyncKind::EventSync;
 }
 
-static TransitionPlan parse_plan(const std::string& s) {
-  if (s == "adjacent") return TransitionPlan::Adjacent;
-  if (s == "extreme") return TransitionPlan::Extreme;
-  if (s == "all") return TransitionPlan::AllPairs;
-  return TransitionPlan::Adjacent;
-}
-
-static SetClockOrder parse_order(const std::string& s) {
-  SetClockOrder o;
-  if (s == "gpu_then_mem") o.kind = SetClockOrder::GpuThenMem;
-  else o.kind = SetClockOrder::MemThenGpu;
-  return o;
-}
-
-static std::string order_str(const SetClockOrder& o) {
-  return (o.kind == SetClockOrder::MemThenGpu) ? "mem_then_gpu" : "gpu_then_mem";
-}
-
 // -----------------------------
 // main
 // -----------------------------
@@ -839,25 +616,22 @@ int main(int argc, char** argv) {
 
   int device_id = get_arg_int(argc, argv, "--device", 0);
   std::string mode_s = get_arg(argc, argv, "--mode", "idle");
-  std::string out_path = get_arg(argc, argv, "--out", "dvfs_latency.csv");
+  std::string out_path = get_arg(argc, argv, "--out", "dvfs_latency_gpu_only.csv");
 
-  int iters = get_arg_int(argc, argv, "--iters", 200);
+  // Longer defaults (credibility)
+  int iters = get_arg_int(argc, argv, "--iters", 300);
   int poll_us = get_arg_int(argc, argv, "--poll_us", 2000);
-  int stable_n = get_arg_int(argc, argv, "--stable_n", 5);
-  int timeout_ms = get_arg_int(argc, argv, "--timeout_ms", 2000);
-  int warmup_trans = get_arg_int(argc, argv, "--warmup_trans", 20);
-  int warmup_ms = get_arg_int(argc, argv, "--warmup_ms", 1000);
+  int stable_n = get_arg_int(argc, argv, "--stable_n", 10);
+  int timeout_ms = get_arg_int(argc, argv, "--timeout_ms", 8000);
+  int warmup_trans = get_arg_int(argc, argv, "--warmup_trans", 100);
+  int warmup_ms = get_arg_int(argc, argv, "--warmup_ms", 10000);
 
-  int pick_core = get_arg_int(argc, argv, "--pick_core", 4);
-  int pick_mem = get_arg_int(argc, argv, "--pick_mem", 3);
+  int metric_window_ms = get_arg_int(argc, argv, "--metric_window_ms", 200);
+  int metric_interval_ms = get_arg_int(argc, argv, "--metric_interval_ms", 50);
 
+  int pick_core = get_arg_int(argc, argv, "--pick_core", 6);
   std::string core_list_s = get_arg(argc, argv, "--core_list", "");
-  std::string mem_list_s  = get_arg(argc, argv, "--mem_list", "");
-
   std::string plan_s = get_arg(argc, argv, "--transitions", "adjacent");
-  std::string order_s = get_arg(argc, argv, "--order", "mem_then_gpu");
-
-  std::string smi_csv_path = get_arg(argc, argv, "--smi_csv", "supported_clocks.csv");
 
   std::string api_s = get_arg(argc, argv, "--api", "auto");
   ClockApiKind api_kind = parse_api_kind(api_s);
@@ -884,7 +658,6 @@ int main(int argc, char** argv) {
 
   WorkloadMode mode = parse_mode(mode_s);
   TransitionPlan plan = parse_plan(plan_s);
-  SetClockOrder order = parse_order(order_s);
 
   // Open NVML + device
   NvmlCtx nv = nvml_open_device(device_id);
@@ -902,7 +675,7 @@ int main(int argc, char** argv) {
     cudaFree(0);
   }
 
-  // Read current clocks (for probe)
+  // Read current clocks
   auto cur_g = nvml_get_clock_mhz(nv.dev, NVML_CLOCK_GRAPHICS);
   auto cur_m = nvml_get_clock_mhz(nv.dev, NVML_CLOCK_MEM);
   if (!cur_g.has_value() || !cur_m.has_value()) {
@@ -911,8 +684,13 @@ int main(int argc, char** argv) {
     return 3;
   }
 
-  // Permission / support probe: locked gpu + locked mem + app
-  bool locked_gpu_ok = false, locked_mem_ok = false, app_ok = false;
+  // Decide mem_fixed:
+  // - For app mode, use current applications mem clock if available; else use current clockinfo mem.
+  unsigned int mem_fixed = *cur_m;
+  if (auto app_m = nvml_get_app_clock_mhz(nv.dev, NVML_CLOCK_MEM); app_m.has_value()) mem_fixed = *app_m;
+
+  // Probe support: locked_gpu + app_clocks (mem lock intentionally ignored)
+  bool locked_gpu_ok = false, app_ok = false;
 
   {
     nvmlReturn_t rG = nvmlDeviceSetGpuLockedClocks(nv.dev, *cur_g, *cur_g);
@@ -922,98 +700,79 @@ int main(int argc, char** argv) {
       return 4;
     }
     locked_gpu_ok = (rG == NVML_SUCCESS);
+    reset_locked_gpu(nv.dev);
 
-    nvmlReturn_t rM = nvmlDeviceSetMemoryLockedClocks(nv.dev, *cur_m, *cur_m);
-    if (rM == NVML_ERROR_NO_PERMISSION) {
-      std::fprintf(stderr, "ERROR: NO_PERMISSION to set locked MEM clocks. Run as root/admin.\n");
-      nvml_close();
-      return 4;
-    }
-    locked_mem_ok = (rM == NVML_SUCCESS);
-
-    reset_locked_clocks(nv.dev);
-
-    nvmlReturn_t rA = nvmlDeviceSetApplicationsClocks(nv.dev, *cur_m, *cur_g);
+    nvmlReturn_t rA = nvmlDeviceSetApplicationsClocks(nv.dev, mem_fixed, *cur_g);
     if (rA == NVML_ERROR_NO_PERMISSION) {
       app_ok = false;
     } else {
       app_ok = (rA == NVML_SUCCESS);
-      if (app_ok) reset_app_clocks(nv.dev);
+      if (app_ok) reset_app(nv.dev);
     }
   }
 
-  std::fprintf(stderr, "Probe: locked_gpu=%s locked_mem=%s app=%s\n",
+  std::fprintf(stderr, "Probe: locked_gpu=%s app=%s (mem_fixed=%u MHz)\n",
                locked_gpu_ok ? "OK" : "NO",
-               locked_mem_ok ? "OK" : "NO",
-               app_ok ? "OK" : "NO");
+               app_ok ? "OK" : "NO",
+               mem_fixed);
 
-  // If user chose auto, but locked incomplete, fallback preference.
-  if (api_kind == ClockApiKind::Auto) {
-    if (!(locked_gpu_ok && locked_mem_ok)) {
-      if (app_ok) {
-        std::fprintf(stderr, "[INFO] Auto API: locked not fully available -> will fallback to app when needed.\n");
-      } else {
-        std::fprintf(stderr, "[ERROR] Auto API: neither locked nor app is usable.\n");
-        nvml_close();
-        return 4;
+  if (!locked_gpu_ok && !app_ok) {
+    std::fprintf(stderr, "[ERROR] Neither locked_gpu nor app_clocks is usable.\n");
+    nvml_close();
+    return 4;
+  }
+
+  // Select GPU points:
+  // We enumerate supported graphics clocks under mem_fixed (since supported g clocks depend on mem).
+  std::vector<unsigned int> g_all = nvml_get_supported_graphics_clocks(nv.dev, mem_fixed);
+
+  if (g_all.empty()) {
+    // fallback: try enumerate mems and pick one that yields g clocks
+    auto mems = nvml_get_supported_mem_clocks(nv.dev);
+    for (auto m : mems) {
+      auto gg = nvml_get_supported_graphics_clocks(nv.dev, m);
+      if (!gg.empty()) {
+        mem_fixed = m;
+        g_all = gg;
+        std::fprintf(stderr, "[WARN] mem_fixed not usable for graphics clocks enum; fallback mem_fixed=%u\n", mem_fixed);
+        break;
       }
     }
   }
 
-  // User lists
+  if (g_all.empty()) {
+    std::fprintf(stderr, "ERROR: Cannot enumerate supported graphics clocks via NVML.\n");
+    nvml_close();
+    return 5;
+  }
+
   std::optional<std::vector<unsigned int>> user_core;
-  std::optional<std::vector<unsigned int>> user_mem;
   if (!core_list_s.empty()) user_core = parse_u32_list_csv(core_list_s);
-  if (!mem_list_s.empty())  user_mem  = parse_u32_list_csv(mem_list_s);
 
-  // Build supported-clocks DB:
-  SupportedDB db = build_db_from_nvml(nv.dev);
-  if (db.g_by_mem.empty()) {
-    std::fprintf(stderr, "[WARN] NVML supported clocks enumeration returned empty. Trying nvidia-smi fallbacks...\n");
-    if (file_exists(smi_csv_path)) {
-      db = build_db_from_smi_csv_file(smi_csv_path);
-      if (!db.g_by_mem.empty()) {
-        std::fprintf(stderr, "[INFO] Loaded supported clocks from CSV: %s (pairs=%zu)\n",
-                     smi_csv_path.c_str(), db.size_pairs());
-      }
+  std::vector<unsigned int> gpu_points;
+  if (user_core.has_value() && !user_core->empty()) {
+    // filter by supported
+    for (auto g : *user_core) {
+      if (std::binary_search(g_all.begin(), g_all.end(), g)) gpu_points.push_back(g);
     }
-    if (db.g_by_mem.empty()) {
-      db = build_db_from_smi_popen();
-      if (!db.g_by_mem.empty()) {
-        std::fprintf(stderr, "[INFO] Loaded supported clocks via popen(nvidia-smi) (pairs=%zu)\n", db.size_pairs());
-      }
+    gpu_points = sort_unique(gpu_points);
+    if (gpu_points.empty()) {
+      gpu_points = pick_evenly(g_all, std::max(2, pick_core));
     }
+  } else {
+    gpu_points = pick_evenly(g_all, std::max(2, pick_core));
   }
 
-  if (db.g_by_mem.empty()) {
-    std::fprintf(stderr,
-      "ERROR: Cannot obtain supported clocks from NVML or nvidia-smi.\n"
-      "Try manually generating supported_clocks.csv:\n"
-      "  nvidia-smi --query-supported-clocks=mem,gr --format=csv,noheader,nounits > supported_clocks.csv\n"
-      "and run with --smi_csv supported_clocks.csv\n");
+  if (gpu_points.size() < 2) {
+    std::fprintf(stderr, "Not enough GPU clock points selected.\n");
     nvml_close();
-    return 5;
+    return 6;
   }
 
-  // Select DVFS points from DB
-  std::vector<DvfsPoint> points = select_points_from_db(db, user_core, user_mem, pick_core, pick_mem);
-  if (points.size() < 2) {
-    std::fprintf(stderr,
-      "Not enough DVFS points selected.\n"
-      "Tips:\n"
-      "  - Try specify both --mem_list and --core_list\n"
-      "  - Or increase --pick_mem / --pick_core\n"
-      "  - Or provide correct --smi_csv (default supported_clocks.csv)\n");
-    auto mems = db.mems();
-    if (!mems.empty()) std::fprintf(stderr, "  DB mem range: [%u .. %u], mem count=%zu\n", mems.front(), mems.back(), mems.size());
-    nvml_close();
-    return 5;
-  }
+  std::fprintf(stderr, "Selected GPU points (%zu) @ mem_fixed=%u:\n", gpu_points.size(), mem_fixed);
+  for (auto g : gpu_points) std::fprintf(stderr, "  %u\n", g);
 
-  std::fprintf(stderr, "Selected DVFS points (%zu):\n", points.size());
-  for (auto& p : points) std::fprintf(stderr, "  %s\n", point_str(p).c_str());
-
-  std::vector<std::pair<DvfsPoint, DvfsPoint>> transitions = build_transitions(points, plan);
+  std::vector<std::pair<unsigned int, unsigned int>> transitions = build_transitions(gpu_points, plan);
   if (transitions.empty()) {
     std::fprintf(stderr, "No transitions built.\n");
     nvml_close();
@@ -1041,22 +800,23 @@ int main(int argc, char** argv) {
   start_workload(wcfg, &wh);
 
   // Warmup time
-  if (warmup_ms > 0) {
-    std::fprintf(stderr, "Warmup sleep: %d ms\n", warmup_ms);
-    std::this_thread::sleep_for(std::chrono::milliseconds(warmup_ms));
-  }
+  std::fprintf(stderr, "Warmup sleep: %d ms\n", warmup_ms);
+  sleep_ms(warmup_ms);
 
-  // Warmup DVFS transitions (not logged)
+  // Warmup transitions (not logged)
   if (warmup_trans > 0 && !transitions.empty()) {
     std::fprintf(stderr, "Warmup transitions: %d\n", warmup_trans);
     auto [a, b] = transitions.front();
 
     SetClockApiLatencyUs api{};
-    (void)set_and_settle(nv.dev, a.gpu_mhz, a.mem_mhz, order, poll_us, stable_n, timeout_ms, api_kind, &api);
+    (void)set_and_settle_gpu_only(nv.dev, a, mem_fixed, poll_us, stable_n, timeout_ms,
+                                  api_kind, locked_gpu_ok, app_ok, &api);
 
     for (int i = 0; i < warmup_trans; ++i) {
-      (void)set_and_settle(nv.dev, b.gpu_mhz, b.mem_mhz, order, poll_us, stable_n, timeout_ms, api_kind, &api);
-      (void)set_and_settle(nv.dev, a.gpu_mhz, a.mem_mhz, order, poll_us, stable_n, timeout_ms, api_kind, &api);
+      (void)set_and_settle_gpu_only(nv.dev, b, mem_fixed, poll_us, stable_n, timeout_ms,
+                                    api_kind, locked_gpu_ok, app_ok, &api);
+      (void)set_and_settle_gpu_only(nv.dev, a, mem_fixed, poll_us, stable_n, timeout_ms,
+                                    api_kind, locked_gpu_ok, app_ok, &api);
     }
   }
 
@@ -1065,22 +825,26 @@ int main(int argc, char** argv) {
   auto energy0 = nvml_get_energy_mj(nv.dev);
 
   for (const auto& tr : transitions) {
-    const DvfsPoint from = tr.first;
-    const DvfsPoint to   = tr.second;
+    unsigned int from = tr.first;
+    unsigned int to = tr.second;
 
-    std::fprintf(stderr, "Transition %s -> %s\n", point_str(from).c_str(), point_str(to).c_str());
+    std::fprintf(stderr, "Transition %u -> %u\n", from, to);
 
     for (int i = 0; i < iters; ++i) {
-      // IMPORTANT: force real transition each iteration
+      // Force REAL transition each iteration: go back to 'from' (best-effort)
       {
         SetClockApiLatencyUs api_tmp{};
-        (void)set_and_settle(nv.dev, from.gpu_mhz, from.mem_mhz, order,
-                             poll_us, stable_n, timeout_ms, api_kind, &api_tmp);
+        (void)set_and_settle_gpu_only(nv.dev, from, mem_fixed, poll_us, stable_n, timeout_ms,
+                                      api_kind, locked_gpu_ok, app_ok, &api_tmp);
       }
 
+      // Quantify workload intensity around the transition (avg window)
+      auto met = sample_metrics_avg(nv.dev, metric_window_ms, metric_interval_ms);
+
+      // Measure transition 'to'
       SetClockApiLatencyUs api{};
-      SettleResult settle = set_and_settle(nv.dev, to.gpu_mhz, to.mem_mhz, order,
-                                           poll_us, stable_n, timeout_ms, api_kind, &api);
+      SettleResult settle = set_and_settle_gpu_only(nv.dev, to, mem_fixed, poll_us, stable_n, timeout_ms,
+                                                    api_kind, locked_gpu_ok, app_ok, &api);
 
       auto power = nvml_get_power_mw(nv.dev);
       auto energy = nvml_get_energy_mj(nv.dev);
@@ -1090,35 +854,36 @@ int main(int argc, char** argv) {
                     device_id,
                     nv.name,
                     mode_s,
+                    api_kind_str(api_kind),
+                    mem_fixed,
                     from, to,
-                    order_str(order),
                     api,
                     settle,
                     stable_n,
                     poll_us,
                     timeout_ms,
+                    met,
                     power,
                     energy);
 
-      // If it is consistently failing, print to stderr too (helps debug immediately)
       if (!settle.ok) {
-        std::fprintf(stderr, "  [FAIL] iter=%d status=%s (final_g=%u final_m=%u)\n",
-                     i, settle.err.c_str(), settle.final_gpu_mhz, settle.final_mem_mhz);
+        std::fprintf(stderr, "  [FAIL] iter=%d status=%s (final_g=%u)\n",
+                     i, settle.status.c_str(), settle.final_gpu_mhz);
       }
     }
   }
 
   destroy_workload(&wh);
 
-  // Reset clocks according to chosen API
+  // Reset clocks
   if (api_kind == ClockApiKind::App) {
-    reset_app_clocks(nv.dev);
+    reset_app(nv.dev);
   } else if (api_kind == ClockApiKind::Locked) {
-    reset_locked_clocks(nv.dev);
+    reset_locked_gpu(nv.dev);
   } else {
     // auto: reset both best-effort
-    reset_locked_clocks(nv.dev);
-    reset_app_clocks(nv.dev);
+    reset_locked_gpu(nv.dev);
+    reset_app(nv.dev);
   }
 
   auto energy1 = nvml_get_energy_mj(nv.dev);
