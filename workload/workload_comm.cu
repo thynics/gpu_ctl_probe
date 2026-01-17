@@ -1,4 +1,10 @@
 // workload_comm.cu
+
+#ifdef __f
+#undef __f
+#endif
+
+
 #include "workload_comm.h"
 
 #include <algorithm>

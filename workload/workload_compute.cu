@@ -1,4 +1,9 @@
 // workload_compute.cu
+#ifdef __f
+#undef __f
+#endif
+
+
 #include "workload_compute.h"
 
 #include <algorithm>
