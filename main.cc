@@ -1,27 +1,19 @@
 // main.cc
 // DVFS latency benchmark (V100 target) - mode: idle / compute / comm
 //
-// Build (example):
-//   g++/nvcc must see NVML headers (nvml.h) and link -lnvidia-ml.
-//   Final link recommended with nvcc (because .cu objects):
-//
-//   nvcc -O3 -std=c++17 -arch=sm_70 -c workload_compute.cu -o workload_compute.o
-//   nvcc -O3 -std=c++17 -arch=sm_70 -c workload_comm.cu    -o workload_comm.o
-//   g++  -O3 -std=c++17 -c main.cc -o main.o
-//   nvcc -O3 -std=c++17 -arch=sm_70 main.o workload_compute.o workload_comm.o
-//        -lnvidia-ml -Xcompiler -pthread -o dvfs_latency_bench
-//
-// Run (example):
-//   sudo ./dvfs_latency_bench --device 0 --mode compute --out out.csv
-//   sudo ./dvfs_latency_bench --mode comm --comm_bytes 1048576 --comm_burst 1 --out out.csv
-//
 // Notes:
 //   - Uses nvmlDeviceSetGpuLockedClocks / nvmlDeviceSetMemoryLockedClocks.
 //   - Measures API latency + settle latency by polling nvmlDeviceGetClockInfo.
 //   - Workload is optional (idle = no workload).
 //
+// IMPORTANT FIXES in this version:
+//   - Robust supported-clocks enumeration (NVML no longer uses nullptr probe).
+//   - Auto fallback to nvidia-smi supported clocks (via CSV file or popen()).
+//
+
 #include <cmath>
 #include <nvml.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -30,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -159,6 +152,8 @@ static void print_usage() {
     "  --pick_mem  K            if no mem_list,  pick K points evenly (default 3)\n"
     "  --transitions adjacent|extreme|all (default adjacent)\n"
     "  --order mem_then_gpu|gpu_then_mem (default mem_then_gpu)\n"
+    "  --smi_csv PATH           fallback supported clocks CSV (default supported_clocks.csv)\n"
+    "                          (format: mem, gr  e.g. \"877, 1530\")\n"
     "\n"
     "Compute workload options (mode=compute):\n"
     "  --compute_kind compute|mem|mixed (default compute)\n"
@@ -233,22 +228,54 @@ static std::optional<unsigned int> nvml_get_clock_mhz(nvmlDevice_t dev, nvmlCloc
   return mhz;
 }
 
+// Robust supported-clocks query (avoid nullptr probe).
 static std::vector<unsigned int> nvml_get_supported_mem_clocks(nvmlDevice_t dev) {
-  unsigned int n = 0;
-  nvmlReturn_t r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, nullptr);
-  if (!nvml_ok(r) || n == 0) return {};
+  unsigned int n = 64;
   std::vector<unsigned int> mem(n);
-  NVML_CHECK(nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data()));
+
+  nvmlReturn_t r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
+  if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
+    mem.resize(n);
+    r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
+  }
+
+  if (!nvml_ok(r) || n == 0) {
+    // try again with a larger buffer
+    n = 256;
+    mem.assign(n, 0);
+    r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
+    if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
+      mem.resize(n);
+      r = nvmlDeviceGetSupportedMemoryClocks(dev, &n, mem.data());
+    }
+  }
+
+  if (!nvml_ok(r) || n == 0) return {};
   mem.resize(n);
   return sort_unique(mem);
 }
 
 static std::vector<unsigned int> nvml_get_supported_graphics_clocks(nvmlDevice_t dev, unsigned int mem_mhz) {
-  unsigned int n = 0;
-  nvmlReturn_t r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, nullptr);
-  if (!nvml_ok(r) || n == 0) return {};
+  unsigned int n = 128;
   std::vector<unsigned int> gr(n);
-  NVML_CHECK(nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data()));
+
+  nvmlReturn_t r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
+  if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
+    gr.resize(n);
+    r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
+  }
+
+  if (!nvml_ok(r) || n == 0) {
+    n = 512;
+    gr.assign(n, 0);
+    r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
+    if (r == NVML_ERROR_INSUFFICIENT_SIZE) {
+      gr.resize(n);
+      r = nvmlDeviceGetSupportedGraphicsClocks(dev, mem_mhz, &n, gr.data());
+    }
+  }
+
+  if (!nvml_ok(r) || n == 0) return {};
   gr.resize(n);
   return sort_unique(gr);
 }
@@ -336,11 +363,9 @@ static SettleResult set_and_settle(nvmlDevice_t dev,
   if (!nvml_ok(rset)) {
     res.ok = false;
     res.err = nvml_err(rset);
-    // Common: NO_PERMISSION
     return res;
   }
 
-  // Poll until stable_n consecutive matches
   int consec = 0;
   int polls = 0;
   uint64_t deadline = t_start + (uint64_t)timeout_ms * 1000ull;
@@ -383,7 +408,7 @@ static SettleResult set_and_settle(nvmlDevice_t dev,
 }
 
 // -----------------------------
-// DVFS point / transition plan
+// DVFS point / supported DB
 // -----------------------------
 struct DvfsPoint {
   unsigned int gpu_mhz = 0;
@@ -396,6 +421,144 @@ static std::string point_str(const DvfsPoint& p) {
   return os.str();
 }
 
+struct SupportedDB {
+  // mem -> sorted unique graphics clocks
+  std::map<unsigned int, std::vector<unsigned int>> g_by_mem;
+
+  std::vector<unsigned int> mems() const {
+    std::vector<unsigned int> out;
+    out.reserve(g_by_mem.size());
+    for (auto& kv : g_by_mem) out.push_back(kv.first);
+    return out;
+  }
+
+  size_t size_pairs() const {
+    size_t s = 0;
+    for (auto& kv : g_by_mem) s += kv.second.size();
+    return s;
+  }
+};
+
+static SupportedDB build_db_from_nvml(nvmlDevice_t dev) {
+  SupportedDB db;
+  auto mems = nvml_get_supported_mem_clocks(dev);
+  for (auto m : mems) {
+    auto gs = nvml_get_supported_graphics_clocks(dev, m);
+    if (!gs.empty()) db.g_by_mem[m] = gs;
+  }
+  return db;
+}
+
+static bool parse_mem_gr_line(const std::string& line, unsigned int* mem, unsigned int* gr) {
+  // formats tolerated:
+  //   "877, 1530"
+  //   "877,1530"
+  //   "877 1530"
+  if (line.empty()) return false;
+  // find first number
+  char* end = nullptr;
+  unsigned long m = std::strtoul(line.c_str(), &end, 10);
+  if (end == line.c_str()) return false;
+  while (*end && (*end == ' ' || *end == ',' || *end == '\t')) ++end;
+  if (!*end) return false;
+  unsigned long g = std::strtoul(end, nullptr, 10);
+  if (m == 0 || g == 0) return false;
+  *mem = (unsigned int)m;
+  *gr  = (unsigned int)g;
+  return true;
+}
+
+static SupportedDB build_db_from_smi_csv_file(const std::string& path) {
+  SupportedDB db;
+  std::ifstream in(path);
+  if (!in.good()) return db;
+  std::string line;
+  while (std::getline(in, line)) {
+    unsigned int mem=0, gr=0;
+    if (!parse_mem_gr_line(line, &mem, &gr)) continue;
+    db.g_by_mem[mem].push_back(gr);
+  }
+  for (auto& kv : db.g_by_mem) kv.second = sort_unique(kv.second);
+  return db;
+}
+
+static SupportedDB build_db_from_smi_popen() {
+  SupportedDB db;
+  const char* cmd = "nvidia-smi --query-supported-clocks=mem,gr --format=csv,noheader,nounits";
+  FILE* fp = popen(cmd, "r");
+  if (!fp) return db;
+
+  char buf[512];
+  while (std::fgets(buf, sizeof(buf), fp)) {
+    std::string line(buf);
+    // strip newline
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    unsigned int mem=0, gr=0;
+    if (!parse_mem_gr_line(line, &mem, &gr)) continue;
+    db.g_by_mem[mem].push_back(gr);
+  }
+  pclose(fp);
+
+  for (auto& kv : db.g_by_mem) kv.second = sort_unique(kv.second);
+  return db;
+}
+
+static std::vector<DvfsPoint> select_points_from_db(const SupportedDB& db,
+                                                    std::optional<std::vector<unsigned int>> user_core_list,
+                                                    std::optional<std::vector<unsigned int>> user_mem_list,
+                                                    int pick_core,
+                                                    int pick_mem) {
+  std::vector<unsigned int> mem_all = db.mems();
+  if (mem_all.empty()) return {};
+
+  std::vector<unsigned int> mem_sel;
+  if (user_mem_list.has_value() && !user_mem_list->empty()) {
+    mem_sel = sort_unique(*user_mem_list);
+  } else {
+    mem_sel = pick_evenly(mem_all, std::max(1, pick_mem));
+  }
+
+  std::vector<DvfsPoint> points;
+
+  for (unsigned int mem_mhz : mem_sel) {
+    auto it = db.g_by_mem.find(mem_mhz);
+    if (it == db.g_by_mem.end() || it->second.empty()) continue;
+
+    const std::vector<unsigned int>& g_all = it->second;
+    std::vector<unsigned int> g_sel;
+
+    if (user_core_list.has_value() && !user_core_list->empty()) {
+      std::vector<unsigned int> gl = sort_unique(*user_core_list);
+      for (auto g : gl) {
+        if (std::binary_search(g_all.begin(), g_all.end(), g)) g_sel.push_back(g);
+      }
+      g_sel = sort_unique(g_sel);
+      if (g_sel.empty()) {
+        g_sel = pick_evenly(g_all, std::max(1, pick_core));
+      }
+    } else {
+      g_sel = pick_evenly(g_all, std::max(1, pick_core));
+    }
+
+    for (unsigned int g : g_sel) {
+      points.push_back({g, mem_mhz});
+    }
+  }
+
+  std::sort(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
+    if (a.mem_mhz != b.mem_mhz) return a.mem_mhz < b.mem_mhz;
+    return a.gpu_mhz < b.gpu_mhz;
+  });
+  points.erase(std::unique(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
+    return a.gpu_mhz==b.gpu_mhz && a.mem_mhz==b.mem_mhz;
+  }), points.end());
+
+  return points;
+}
+
+// -----------------------------
+// Transition plan
+// -----------------------------
 enum class TransitionPlan : int {
   Adjacent = 0,
   Extreme  = 1,
@@ -417,8 +580,6 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
     return out;
   }
 
-  // For Adjacent/Extreme we assume points are in some stable order.
-  // We'll sort by mem, then gpu (ascending) for determinism.
   std::vector<DvfsPoint> ps = points;
   std::sort(ps.begin(), ps.end(), [](const DvfsPoint& a, const DvfsPoint& b){
     if (a.mem_mhz != b.mem_mhz) return a.mem_mhz < b.mem_mhz;
@@ -426,14 +587,11 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
   });
 
   if (plan == TransitionPlan::Extreme) {
-    // take global min<->max
     out.push_back({ps.front(), ps.back()});
     out.push_back({ps.back(), ps.front()});
     return out;
   }
 
-  // Adjacent: for each mem group, adjacent gpu points; and for same gpu index, adjacent mem points if possible.
-  // 1) Adjacent in gpu within same mem
   for (size_t i = 1; i < ps.size(); ++i) {
     if (ps[i].mem_mhz == ps[i-1].mem_mhz) {
       out.push_back({ps[i-1], ps[i]});
@@ -441,14 +599,9 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
     }
   }
 
-  // 2) Adjacent in mem for same gpu if exact match exists
-  // Build map from gpu->list of mem points
-  // Simple O(n^2) is fine for small sets.
   for (size_t i = 0; i < ps.size(); ++i) {
     for (size_t j = i + 1; j < ps.size(); ++j) {
       if (ps[i].gpu_mhz == ps[j].gpu_mhz && ps[i].mem_mhz != ps[j].mem_mhz) {
-        // only adjacent mem by sorted order
-        // ensure no other mem in between for same gpu
         bool adjacent = true;
         for (size_t k = 0; k < ps.size(); ++k) {
           if (ps[k].gpu_mhz != ps[i].gpu_mhz) continue;
@@ -463,7 +616,6 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
     }
   }
 
-  // de-dup
   auto key = [](const std::pair<DvfsPoint,DvfsPoint>& e){
     return (uint64_t)e.first.gpu_mhz << 48 ^
            (uint64_t)e.first.mem_mhz << 32 ^
@@ -473,61 +625,6 @@ build_transitions(const std::vector<DvfsPoint>& points, TransitionPlan plan) {
   std::sort(out.begin(), out.end(), [&](auto& a, auto& b){ return key(a) < key(b); });
   out.erase(std::unique(out.begin(), out.end(), [&](auto& a, auto& b){ return key(a)==key(b); }), out.end());
   return out;
-}
-
-static std::vector<DvfsPoint>
-select_points_for_device(nvmlDevice_t dev,
-                         std::optional<std::vector<unsigned int>> user_core_list,
-                         std::optional<std::vector<unsigned int>> user_mem_list,
-                         int pick_core,
-                         int pick_mem) {
-  std::vector<unsigned int> mem_all = nvml_get_supported_mem_clocks(dev);
-  if (mem_all.empty()) return {};
-
-  std::vector<unsigned int> mem_sel;
-  if (user_mem_list.has_value() && !user_mem_list->empty()) {
-    mem_sel = sort_unique(*user_mem_list);
-  } else {
-    mem_sel = pick_evenly(mem_all, std::max(1, pick_mem));
-  }
-
-  std::vector<DvfsPoint> points;
-
-  for (unsigned int mem_mhz : mem_sel) {
-    std::vector<unsigned int> g_all = nvml_get_supported_graphics_clocks(dev, mem_mhz);
-    if (g_all.empty()) continue;
-
-    std::vector<unsigned int> g_sel;
-    if (user_core_list.has_value() && !user_core_list->empty()) {
-      // filter user list by supported set for this mem
-      std::vector<unsigned int> gl = sort_unique(*user_core_list);
-      for (auto g : gl) {
-        if (std::binary_search(g_all.begin(), g_all.end(), g)) g_sel.push_back(g);
-      }
-      g_sel = sort_unique(g_sel);
-      if (g_sel.empty()) {
-        // if user's list is incompatible, fall back to evenly picking.
-        g_sel = pick_evenly(g_all, std::max(1, pick_core));
-      }
-    } else {
-      g_sel = pick_evenly(g_all, std::max(1, pick_core));
-    }
-
-    for (unsigned int g : g_sel) {
-      points.push_back({g, mem_mhz});
-    }
-  }
-
-  // de-dup + stable order
-  std::sort(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
-    if (a.mem_mhz != b.mem_mhz) return a.mem_mhz < b.mem_mhz;
-    return a.gpu_mhz < b.gpu_mhz;
-  });
-  points.erase(std::unique(points.begin(), points.end(), [](const DvfsPoint& a, const DvfsPoint& b){
-    return a.gpu_mhz==b.gpu_mhz && a.mem_mhz==b.mem_mhz;
-  }), points.end());
-
-  return points;
 }
 
 // -----------------------------
@@ -659,6 +756,9 @@ int main(int argc, char** argv) {
   std::string plan_s = get_arg(argc, argv, "--transitions", "adjacent");
   std::string order_s = get_arg(argc, argv, "--order", "mem_then_gpu");
 
+  // NEW: smi csv path (optional)
+  std::string smi_csv_path = get_arg(argc, argv, "--smi_csv", "supported_clocks.csv");
+
   // workload params
   ComputeWorkloadParams cwp;
   cwp.device_id = device_id;
@@ -687,8 +787,7 @@ int main(int argc, char** argv) {
   NvmlCtx nv = nvml_open_device(device_id);
   std::fprintf(stderr, "GPU[%d]: %s\n", device_id, nv.name.c_str());
 
-  // Basic permission probe (attempt a no-op set to current clock).
-  // We'll only do a cheap call; if no permission, fail early.
+  // Permission probe
   auto cur_g = nvml_get_clock_mhz(nv.dev, NVML_CLOCK_GRAPHICS);
   auto cur_m = nvml_get_clock_mhz(nv.dev, NVML_CLOCK_MEM);
   if (!cur_g.has_value() || !cur_m.has_value()) {
@@ -696,9 +795,7 @@ int main(int argc, char** argv) {
     nvml_close();
     return 3;
   }
-
   {
-    uint64_t dummy_us = 0;
     nvmlReturn_t r = nvmlDeviceSetGpuLockedClocks(nv.dev, *cur_g, *cur_g);
     if (r == NVML_ERROR_NO_PERMISSION) {
       std::fprintf(stderr, "ERROR: NVML reports NO_PERMISSION to set locked clocks. Run as root/admin.\n");
@@ -710,27 +807,65 @@ int main(int argc, char** argv) {
       nvml_close();
       return 4;
     }
-    // reset it back (best-effort)
-    (void)dummy_us;
     reset_locked_clocks(nv.dev);
   }
 
-  // Make sure CUDA context exists (important for idle mode too)
+  // Make sure CUDA context exists
   {
-    // keep consistent with workload modules
     cudaSetDevice(device_id);
     cudaFree(0);
   }
 
-  // Select DVFS points
+  // User lists
   std::optional<std::vector<unsigned int>> user_core;
   std::optional<std::vector<unsigned int>> user_mem;
   if (!core_list_s.empty()) user_core = parse_u32_list_csv(core_list_s);
   if (!mem_list_s.empty())  user_mem  = parse_u32_list_csv(mem_list_s);
 
-  std::vector<DvfsPoint> points = select_points_for_device(nv.dev, user_core, user_mem, pick_core, pick_mem);
+  // Build supported-clocks DB:
+  // 1) Try NVML (robust)
+  // 2) If empty, try CSV file
+  // 3) If file missing/empty, popen nvidia-smi and parse directly
+  SupportedDB db = build_db_from_nvml(nv.dev);
+  if (db.g_by_mem.empty()) {
+    std::fprintf(stderr, "[WARN] NVML supported clocks enumeration returned empty. Trying nvidia-smi fallbacks...\n");
+    if (file_exists(smi_csv_path)) {
+      db = build_db_from_smi_csv_file(smi_csv_path);
+      if (!db.g_by_mem.empty()) {
+        std::fprintf(stderr, "[INFO] Loaded supported clocks from CSV: %s (pairs=%zu)\n",
+                     smi_csv_path.c_str(), db.size_pairs());
+      }
+    }
+    if (db.g_by_mem.empty()) {
+      db = build_db_from_smi_popen();
+      if (!db.g_by_mem.empty()) {
+        std::fprintf(stderr, "[INFO] Loaded supported clocks via popen(nvidia-smi) (pairs=%zu)\n", db.size_pairs());
+      }
+    }
+  }
+
+  if (db.g_by_mem.empty()) {
+    std::fprintf(stderr,
+      "ERROR: Cannot obtain supported clocks from NVML or nvidia-smi.\n"
+      "Try manually generating supported_clocks.csv:\n"
+      "  nvidia-smi --query-supported-clocks=mem,gr --format=csv,noheader,nounits > supported_clocks.csv\n"
+      "and run with --smi_csv supported_clocks.csv\n");
+    nvml_close();
+    return 5;
+  }
+
+  // Select DVFS points from DB
+  std::vector<DvfsPoint> points = select_points_from_db(db, user_core, user_mem, pick_core, pick_mem);
   if (points.size() < 2) {
-    std::fprintf(stderr, "Not enough DVFS points selected. Try --core_list/--mem_list or adjust --pick_core/--pick_mem.\n");
+    std::fprintf(stderr,
+      "Not enough DVFS points selected.\n"
+      "Tips:\n"
+      "  - Try specify both --mem_list and --core_list\n"
+      "  - Or increase --pick_mem / --pick_core\n"
+      "  - Or provide correct --smi_csv (default supported_clocks.csv)\n");
+    // extra debug
+    auto mems = db.mems();
+    if (!mems.empty()) std::fprintf(stderr, "  DB mem range: [%u .. %u], mem count=%zu\n", mems.front(), mems.back(), mems.size());
     nvml_close();
     return 5;
   }
@@ -765,18 +900,17 @@ int main(int argc, char** argv) {
   WorkloadHandle wh;
   start_workload(wcfg, &wh);
 
-  // Warmup time (let workload stabilize)
+  // Warmup time
   if (warmup_ms > 0) {
     std::fprintf(stderr, "Warmup sleep: %d ms\n", warmup_ms);
     std::this_thread::sleep_for(std::chrono::milliseconds(warmup_ms));
   }
 
-  // Warmup DVFS transitions (not logged): use first built transition repeatedly
+  // Warmup DVFS transitions (not logged)
   if (warmup_trans > 0 && !transitions.empty()) {
     std::fprintf(stderr, "Warmup transitions: %d\n", warmup_trans);
     auto [a, b] = transitions.front();
 
-    // ensure start at a
     SetClockApiLatencyUs api{};
     (void)set_and_settle(nv.dev, a.gpu_mhz, a.mem_mhz, order, poll_us, stable_n, timeout_ms, &api);
 
@@ -786,17 +920,15 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Measurement loop
   std::fprintf(stderr, "Measuring... iters per transition=%d\n", iters);
 
-  // Optionally: snapshot energy baseline
   auto energy0 = nvml_get_energy_mj(nv.dev);
 
   for (const auto& tr : transitions) {
     const DvfsPoint from = tr.first;
     const DvfsPoint to   = tr.second;
 
-    // Set to "from" first (not logged) to ensure transition is from->to
+    // Set to "from" first (not logged)
     {
       SetClockApiLatencyUs api{};
       (void)set_and_settle(nv.dev, from.gpu_mhz, from.mem_mhz, order, poll_us, stable_n, timeout_ms, &api);
@@ -824,14 +956,9 @@ int main(int argc, char** argv) {
                     timeout_ms,
                     power,
                     energy);
-
-      // swap direction each time if you want "ping-pong" within the same pair:
-      // Here we measure strictly from->to repeated; the plan already adds both directions.
-      // If you prefer ping-pong, you can toggle target each iteration.
     }
   }
 
-  // Cleanup
   destroy_workload(&wh);
   reset_locked_clocks(nv.dev);
 
