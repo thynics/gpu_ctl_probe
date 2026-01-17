@@ -117,7 +117,7 @@ static std::vector<unsigned int> pick_evenly(const std::vector<unsigned int>& so
   out.reserve(k);
   for (int i = 0; i < k; ++i) {
     double t = (k == 1) ? 0.0 : (double)i / (double)(k - 1);
-    size_t idx = (size_t)std::llround(t * (double)(sorted_asc.size() - 1));
+    size_t idx = (size_t)(t * (double)(sorted_asc.size() - 1) + 0.5);
     out.push_back(sorted_asc[idx]);
   }
   return sort_unique(out);
