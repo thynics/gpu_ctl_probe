@@ -1,403 +1,399 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-analyze_dvfs.py
-================
-Analyze dvfs_latency_bench CSV and produce:
-  - Summary tables (CSV)
-  - A markdown report (report.md)
-  - Line charts (PNG): ECDFs, tail curves, timeseries drift
-
-Works with the CSV format emitted by your main.cc:
-ts_us,device_id,gpu_name,mode,from_gpu_mhz,from_mem_mhz,to_gpu_mhz,to_mem_mhz,order,
-api_mem_us,api_gpu_us,api_total_us,settle_total_us,settle_after_calls_us,polls,stable_n,poll_us,timeout_ms,
-final_gpu_mhz,final_mem_mhz,power_mw,energy_mj,status
-
-Usage examples:
-  python3 analyze_dvfs.py idle.csv --outdir out_idle
-  python3 analyze_dvfs.py idle.csv compute.csv comm.csv --outdir out_all
-"""
-
 import argparse
-import math
 import os
+import math
 from pathlib import Path
-from typing import Dict, List, Tuple
-
+import numpy as np
 import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
 
+# -------------------------
+# Helpers
+# -------------------------
+NUM_COLS = [
+    "ts_us",
+    "device_id",
+    "mem_fixed_mhz",
+    "from_gpu_mhz",
+    "to_gpu_mhz",
+    "api_us",
+    "settle_total_us",
+    "settle_after_call_us",
+    "polls",
+    "stable_n",
+    "poll_us",
+    "timeout_ms",
+    "final_gpu_mhz",
+    "gpu_util_pct",
+    "mem_util_pct",
+    "pcie_tx_kbps",
+    "pcie_rx_kbps",
+    "power_mw",
+    "energy_mj",
+]
 
-PCTS = [0.5, 0.9, 0.95, 0.99]
+STR_COLS = ["gpu_name", "mode", "api_kind", "status"]
 
+def ensure_outdir(out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def _fmt_us(x: float) -> str:
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return "NA"
-    if x >= 1000.0:
-        return f"{x/1000.0:.3f} ms"
-    return f"{x:.1f} us"
-
-
-def _dir(a: int, b: int) -> str:
-    if b > a:
-        return "up"
-    if b < a:
-        return "down"
-    return "flat"
-
-
-def _transition_type(dg: int, dm: int) -> str:
-    g = (dg != 0)
-    m = (dm != 0)
-    if g and m:
-        return "both"
-    if g:
-        return "gpu_only"
-    if m:
-        return "mem_only"
-    return "noop"
-
-
-def _percentiles(s: pd.Series, pcts=PCTS) -> Dict[str, float]:
-    out = {}
-    if s is None or s.dropna().empty:
-        for p in pcts:
-            out[f"p{int(p*100)}"] = float("nan")
-        return out
-    qs = s.quantile(pcts, interpolation="linear")
-    for p, v in zip(pcts, qs.values):
-        out[f"p{int(p*100)}"] = float(v)
-    return out
-
-
-def _ecdf_xy(values: pd.Series) -> Tuple[List[float], List[float]]:
-    v = values.dropna().astype(float).sort_values().values
-    if len(v) == 0:
-        return [], []
-    y = [(i + 1) / len(v) for i in range(len(v))]
-    return v.tolist(), y
-
-
-def _ensure_cols_numeric(df: pd.DataFrame, cols: List[str]) -> None:
+def safe_to_numeric(df: pd.DataFrame, cols):
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
-
-def load_csvs(paths: List[str]) -> pd.DataFrame:
-    dfs = []
-    for p in paths:
-        d = pd.read_csv(p)
-        d.columns = [str(c).strip() for c in d.columns]
-        d["__source__"] = os.path.basename(p)
-        dfs.append(d)
-    df = pd.concat(dfs, ignore_index=True)
-
-    num_cols = [
-        "ts_us", "device_id",
-        "from_gpu_mhz", "from_mem_mhz", "to_gpu_mhz", "to_mem_mhz",
-        "api_mem_us", "api_gpu_us", "api_total_us",
-        "settle_total_us", "settle_after_calls_us",
-        "polls", "stable_n", "poll_us", "timeout_ms",
-        "final_gpu_mhz", "final_mem_mhz",
-        "power_mw", "energy_mj",
-    ]
-    _ensure_cols_numeric(df, num_cols)
-
-    for c in ["gpu_name", "mode", "order", "status"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-
-    df["ok"] = (df.get("status", "") == "ok")
-
-    df["delta_gpu_mhz"] = df["to_gpu_mhz"] - df["from_gpu_mhz"]
-    df["delta_mem_mhz"] = df["to_mem_mhz"] - df["from_mem_mhz"]
-    df["dir_gpu"] = df.apply(lambda r: _dir(int(r["from_gpu_mhz"]), int(r["to_gpu_mhz"])), axis=1)
-    df["dir_mem"] = df.apply(lambda r: _dir(int(r["from_mem_mhz"]), int(r["to_mem_mhz"])), axis=1)
-    df["transition_type"] = df.apply(
-        lambda r: _transition_type(int(r["delta_gpu_mhz"]), int(r["delta_mem_mhz"])),
-        axis=1
-    )
-
-    df["pair"] = (
-        df["from_gpu_mhz"].astype("Int64").astype(str) + "@"
-        + df["from_mem_mhz"].astype("Int64").astype(str)
-        + "->"
-        + df["to_gpu_mhz"].astype("Int64").astype(str) + "@"
-        + df["to_mem_mhz"].astype("Int64").astype(str)
-    )
-
-    if "energy_mj" in df.columns:
-        df = df.sort_values(["device_id", "__source__", "ts_us"], kind="mergesort")
-        df["energy_mj_delta"] = df.groupby(["device_id", "__source__"])["energy_mj"].diff()
-    else:
-        df["energy_mj_delta"] = float("nan")
-
     return df
 
-
-def summarize(df: pd.DataFrame) -> Dict[str, object]:
-    out: Dict[str, object] = {}
-    out["rows"] = int(len(df))
-    out["rows_ok"] = int(df["ok"].sum())
-    out["ok_rate"] = float(df["ok"].mean()) if len(df) else float("nan")
-    out["unique_pairs"] = int(df["pair"].nunique())
-
-    if df["ts_us"].notna().any():
-        span_s = (df["ts_us"].max() - df["ts_us"].min()) / 1e6
-        out["timespan_s"] = float(span_s)
-    else:
-        out["timespan_s"] = float("nan")
-
-    ok = df[df["ok"]].copy()
-    for col in ["api_total_us", "api_gpu_us", "api_mem_us", "settle_after_calls_us", "settle_total_us"]:
-        if col in ok.columns:
-            out[col] = {
-                "mean": float(ok[col].mean()) if ok[col].notna().any() else float("nan"),
-                "std": float(ok[col].std()) if ok[col].notna().any() else float("nan"),
-                "min": float(ok[col].min()) if ok[col].notna().any() else float("nan"),
-                "max": float(ok[col].max()) if ok[col].notna().any() else float("nan"),
-                **_percentiles(ok[col]),
-            }
-
-    if "power_mw" in ok.columns and ok["power_mw"].notna().any():
-        out["power_mw"] = {"mean": float(ok["power_mw"].mean()), **_percentiles(ok["power_mw"])}
-
-    if "energy_mj_delta" in ok.columns and ok["energy_mj_delta"].notna().any():
-        ed = ok["energy_mj_delta"]
-        ed = ed[ed >= 0]
-        if len(ed):
-            out["energy_mj_delta"] = {"mean": float(ed.mean()), **_percentiles(ed)}
+def quantiles(series: pd.Series, qs=(0.5, 0.9, 0.95, 0.99)):
+    s = series.dropna()
+    if len(s) == 0:
+        return {f"p{int(q*100)}": np.nan for q in qs}
+    out = {}
+    for q in qs:
+        out[f"p{int(q*100)}"] = float(s.quantile(q))
     return out
 
+def basic_stats(series: pd.Series):
+    s = series.dropna()
+    if len(s) == 0:
+        return dict(n=0, mean=np.nan, std=np.nan, min=np.nan, max=np.nan, **quantiles(series))
+    return dict(
+        n=int(s.shape[0]),
+        mean=float(s.mean()),
+        std=float(s.std(ddof=1)) if s.shape[0] > 1 else 0.0,
+        min=float(s.min()),
+        max=float(s.max()),
+        **quantiles(s),
+    )
 
-def group_table(df: pd.DataFrame, group_cols: List[str], metric: str) -> pd.DataFrame:
-    ok = df[df["ok"]].copy()
-    if ok.empty:
-        return pd.DataFrame()
-
-    g = ok.groupby(group_cols, dropna=False)[metric]
-    res = g.agg(["count", "mean", "median"]).reset_index()
-    for p in PCTS:
-        res[f"p{int(p*100)}"] = g.quantile(p).reset_index(drop=True)
-
-    tot = df.groupby(group_cols, dropna=False).size().reset_index(name="rows_total")
-    okc = df[df["ok"]].groupby(group_cols, dropna=False).size().reset_index(name="rows_ok")
-    res = res.merge(tot, on=group_cols, how="left").merge(okc, on=group_cols, how="left")
-    res["rows_ok"] = res["rows_ok"].fillna(0).astype(int)
-    res["fail_rate"] = 1.0 - (res["rows_ok"] / res["rows_total"].clip(lower=1))
-
-    if "p95" in res.columns:
-        res = res.sort_values("p95", ascending=False, kind="mergesort")
-    return res
-
-
-def write_markdown_report(outdir: Path, df: pd.DataFrame, gsum: Dict[str, object]) -> None:
-    lines = []
-    lines.append("# DVFS latency analysis report\n")
-    lines.append(f"- Rows: {gsum['rows']} | OK: {gsum['rows_ok']} | OK-rate: {gsum['ok_rate']:.3f}\n")
-    if not math.isnan(gsum.get("timespan_s", float('nan'))):
-        lines.append(f"- Timespan: {gsum['timespan_s']:.2f} s\n")
-    lines.append(f"- Unique transitions (pair): {gsum['unique_pairs']}\n")
-
-    def add_block(name: str):
-        blk = gsum.get(name)
-        if not isinstance(blk, dict):
-            return
-        lines.append(f"## {name}\n")
-        lines.append(f"- mean: {_fmt_us(blk.get('mean', float('nan')))}\n")
-        lines.append(f"- p50/p90/p95/p99: {_fmt_us(blk.get('p50', float('nan')))} / {_fmt_us(blk.get('p90', float('nan')))} / {_fmt_us(blk.get('p95', float('nan')))} / {_fmt_us(blk.get('p99', float('nan')))}\n")
-        lines.append(f"- max: {_fmt_us(blk.get('max', float('nan')))}\n")
-
-    add_block("api_total_us")
-    add_block("settle_after_calls_us")
-    add_block("settle_total_us")
-
-    lines.append("## Derived quantitative indices\n")
-    ok = df[df["ok"]].copy()
-    if not ok.empty:
-        # GPU-dir asymmetry per type
-        for typ in ["gpu_only", "mem_only", "both"]:
-            sub = ok[ok["transition_type"] == typ]
-            if sub.empty:
-                continue
-            up = sub[sub["dir_gpu"] == "up"]["settle_total_us"]
-            down = sub[sub["dir_gpu"] == "down"]["settle_total_us"]
-            if not up.dropna().empty and not down.dropna().empty:
-                up_p95 = float(up.quantile(0.95))
-                down_p95 = float(down.quantile(0.95))
-                ratio = up_p95 / max(1e-9, down_p95)
-                lines.append(f"- GPU-dir asymmetry (type={typ}) p95(up)/p95(down): {ratio:.3f}\n")
-
-        # Order effect
-        if "order" in ok.columns and ok["order"].nunique() >= 2:
-            a = ok[ok["order"] == "mem_then_gpu"]["settle_total_us"]
-            b = ok[ok["order"] == "gpu_then_mem"]["settle_total_us"]
-            if not a.dropna().empty and not b.dropna().empty:
-                a95 = float(a.quantile(0.95))
-                b95 = float(b.quantile(0.95))
-                lines.append(f"- Order effect p95(mem_then_gpu)/p95(gpu_then_mem): {a95/max(1e-9,b95):.3f}\n")
-
-        # Wait-share
-        if "api_total_us" in ok.columns and "settle_total_us" in ok.columns:
-            r = (ok["settle_total_us"] - ok["api_total_us"]) / ok["settle_total_us"].clip(lower=1e-9)
-            lines.append(f"- Wait-share mean={float(r.mean()):.3f}, p95={float(r.quantile(0.95)):.3f}\n")
-
-    bad = df[~df["ok"]]
-    if not bad.empty:
-        lines.append("## Failures\n")
-        top = bad.groupby(["mode", "order", "status"], dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-        lines.append(top.head(20).to_markdown(index=False))
-        lines.append("\n")
-
-    lines.append("## Output files\n")
-    lines.append("- summary_tables/: grouped CSV tables (p50/p95/p99, fail_rate)\n")
-    lines.append("- figures/: PNG figures (ECDF, tails, drift)\n")
-
-    (outdir / "report.md").write_text("\n".join(lines), encoding="utf-8")
-
-
-def plot_ecdf(outpath: Path, df: pd.DataFrame, metric: str, label_col: str, title: str) -> None:
-    ok = df[df["ok"]].copy()
-    if ok.empty:
-        return
-
-    plt.figure()
-    for label, sub in ok.groupby(label_col, dropna=False):
-        x, y = _ecdf_xy(sub[metric])
-        if len(x) == 0:
-            continue
-        plt.plot(x, y, label=str(label))
-    plt.xlabel(metric)
-    plt.ylabel("ECDF")
-    plt.title(title)
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.legend()
+def save_fig(path: Path):
     plt.tight_layout()
-    plt.savefig(outpath, dpi=180)
+    plt.savefig(path, dpi=160)
     plt.close()
 
-
-def plot_tail_curve(outpath: Path, df: pd.DataFrame, metric: str, group_cols: List[str], topk: int, title: str) -> None:
-    ok = df[df["ok"]].copy()
-    if ok.empty:
+def plot_hist(series: pd.Series, title: str, xlabel: str, out_png: Path, bins=60, clip_p99=True):
+    s = series.dropna()
+    if len(s) == 0:
         return
-
-    g = ok.groupby(group_cols, dropna=False)[metric].quantile(0.95).reset_index(name="p95")
-    g = g.sort_values("p95", ascending=False).head(topk)
-    if g.empty:
-        return
-
-    x = list(range(1, len(g) + 1))
-    y = g["p95"].astype(float).tolist()
-
+    if clip_p99:
+        hi = s.quantile(0.99)
+        s = s[s <= hi]
     plt.figure()
-    plt.plot(x, y, marker="o")
-    plt.xlabel(f"ranked groups (top {topk})")
-    plt.ylabel(f"p95({metric})")
+    plt.hist(s.values, bins=bins)
     plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("count")
+    save_fig(out_png)
 
-    labels = []
-    for _, row in g.iterrows():
-        labels.append(" | ".join([f"{c}={row[c]}" for c in group_cols]))
-    for i in range(min(10, len(x))):
-        plt.annotate(labels[i], (x[i], y[i]), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7)
-
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=180)
-    plt.close()
-
-
-def plot_timeseries(outpath: Path, df: pd.DataFrame, metric: str, title: str) -> None:
-    ok = df[df["ok"]].copy()
-    if ok.empty or ok["ts_us"].isna().all() or metric not in ok.columns:
+def plot_cdf(series: pd.Series, title: str, xlabel: str, out_png: Path, clip_p999=True):
+    s = series.dropna().sort_values()
+    if len(s) == 0:
         return
-
-    ok = ok.sort_values("ts_us", kind="mergesort")
-    t0 = ok["ts_us"].iloc[0]
-    x = ((ok["ts_us"] - t0) / 1e6).astype(float)
-    y = pd.to_numeric(ok[metric], errors="coerce").astype(float)
-
+    if clip_p999:
+        hi = s.quantile(0.999)
+        s = s[s <= hi]
+    y = np.arange(1, len(s)+1) / len(s)
     plt.figure()
-    plt.plot(x, y, linewidth=1.0)
+    plt.plot(s.values, y)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("CDF")
+    plt.grid(True, which="both", axis="both")
+    save_fig(out_png)
+
+def plot_timeseries(t_s: pd.Series, y: pd.Series, title: str, ylabel: str, out_png: Path):
+    df = pd.DataFrame({"t_s": t_s, "y": y}).dropna()
+    if len(df) == 0:
+        return
+    plt.figure()
+    plt.plot(df["t_s"].values, df["y"].values, linewidth=1.0)
+    plt.title(title)
     plt.xlabel("time since start (s)")
-    plt.ylabel(metric)
+    plt.ylabel(ylabel)
+    save_fig(out_png)
+
+def plot_scatter(x: pd.Series, y: pd.Series, title: str, xlabel: str, ylabel: str, out_png: Path):
+    df = pd.DataFrame({"x": x, "y": y}).dropna()
+    if len(df) == 0:
+        return
+    plt.figure()
+    plt.scatter(df["x"].values, df["y"].values, s=8)
     plt.title(title)
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=180)
-    plt.close()
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    save_fig(out_png)
 
+def plot_box_by_group(df: pd.DataFrame, group_col: str, value_col: str, title: str, out_png: Path, max_groups=30):
+    tmp = df[[group_col, value_col]].dropna()
+    if len(tmp) == 0:
+        return
+    # keep top groups by sample count to avoid unreadable plots
+    counts = tmp[group_col].value_counts()
+    groups = counts.index.tolist()[:max_groups]
+    data = [tmp[tmp[group_col] == g][value_col].values for g in groups]
+    plt.figure(figsize=(max(10, len(groups) * 0.45), 5))
+    plt.boxplot(data, labels=groups, showfliers=False)
+    plt.title(title + (f" (top {len(groups)} groups by N)" if len(groups) < counts.shape[0] else ""))
+    plt.xlabel(group_col)
+    plt.ylabel(value_col)
+    plt.xticks(rotation=45, ha="right")
+    save_fig(out_png)
 
+def corr_spearman(df: pd.DataFrame, cols):
+    # Spearman is robust for monotonic/nonlinear
+    sub = df[cols].dropna()
+    if sub.shape[0] < 3:
+        return None
+    return sub.corr(method="spearman")
+
+# -------------------------
+# Main analysis
+# -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("csv", nargs="+", help="input dvfs_latency_bench csv(s)")
-    ap.add_argument("--outdir", default="dvfs_analysis_out", help="output directory")
-    ap.add_argument("--topk", type=int, default=30, help="top-k groups for tail plots")
+    ap.add_argument("--csv", required=True, help="input dvfs CSV")
+    ap.add_argument("--out", default="dvfs_report", help="output directory")
+    ap.add_argument("--ok_only", type=int, default=0, help="1: analyze only status starting with 'ok'")
+    ap.add_argument("--max_groups", type=int, default=30, help="max transitions in box plot")
     args = ap.parse_args()
 
-    outdir = Path(args.outdir)
-    (outdir / "figures").mkdir(parents=True, exist_ok=True)
-    (outdir / "summary_tables").mkdir(parents=True, exist_ok=True)
+    csv_path = Path(args.csv)
+    out_dir = Path(args.out)
+    ensure_outdir(out_dir)
 
-    df = load_csvs(args.csv)
-    gsum = summarize(df)
+    df = pd.read_csv(csv_path)
+    # normalize columns
+    for c in STR_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+    df = safe_to_numeric(df, NUM_COLS)
 
-    tables: Dict[str, pd.DataFrame] = {}
-    tables["by_mode"] = group_table(df, ["mode"], "settle_total_us")
-    tables["by_mode_order"] = group_table(df, ["mode", "order"], "settle_total_us")
-    tables["by_type_dir"] = group_table(df, ["mode", "order", "transition_type", "dir_gpu", "dir_mem"], "settle_total_us")
-    tables["by_pair"] = group_table(df, ["mode", "order", "pair", "transition_type", "dir_gpu", "dir_mem"], "settle_total_us")
+    # derived columns
+    if "ts_us" in df.columns:
+        t0 = df["ts_us"].min()
+        df["t_s"] = (df["ts_us"] - t0) / 1e6
+    else:
+        df["t_s"] = np.nan
 
-    for name, t in tables.items():
-        if t is not None and not t.empty:
-            t.to_csv(outdir / "summary_tables" / f"{name}.csv", index=False)
+    if "from_gpu_mhz" in df.columns and "to_gpu_mhz" in df.columns:
+        df["transition"] = df["from_gpu_mhz"].astype("Int64").astype(str) + "->" + df["to_gpu_mhz"].astype("Int64").astype(str)
+    else:
+        df["transition"] = "NA"
 
-    bad = df[~df["ok"]].copy()
-    if not bad.empty:
-        fail = bad.groupby(["__source__", "mode", "order", "status"], dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-        fail.to_csv(outdir / "summary_tables" / "failures.csv", index=False)
+    # status buckets
+    if "status" in df.columns:
+        df["is_ok"] = df["status"].str.startswith("ok")
+        df["is_timeout"] = df["status"].str.startswith("timeout")
+    else:
+        df["is_ok"] = True
+        df["is_timeout"] = False
 
-    write_markdown_report(outdir, df, gsum)
+    if args.ok_only == 1:
+        df_use = df[df["is_ok"]].copy()
+    else:
+        df_use = df.copy()
 
-    # figures (line charts)
-    plot_ecdf(outdir / "figures" / "ecdf_settle_by_mode.png",
-              df, "settle_total_us", "mode",
-              "ECDF of settle_total_us by mode")
+    # -------------------------
+    # Summaries
+    # -------------------------
+    total_n = int(df.shape[0])
+    use_n = int(df_use.shape[0])
 
-    plot_ecdf(outdir / "figures" / "ecdf_settle_by_order.png",
-              df, "settle_total_us", "order",
-              "ECDF of settle_total_us by DVFS set order")
+    status_counts = df["status"].value_counts(dropna=False) if "status" in df.columns else pd.Series(dtype=int)
+    api_kinds = df["api_kind"].value_counts(dropna=False) if "api_kind" in df.columns else pd.Series(dtype=int)
+    modes = df["mode"].value_counts(dropna=False) if "mode" in df.columns else pd.Series(dtype=int)
 
-    plot_tail_curve(outdir / "figures" / "tail_worst_pairs_p95.png",
-                    df, "settle_total_us",
-                    ["mode", "order", "pair"],
-                    topk=args.topk,
-                    title="Worst transition pairs by p95(settle_total_us)")
+    key_latency_cols = ["api_us", "settle_after_call_us", "settle_total_us", "polls"]
+    metric_cols = ["gpu_util_pct", "mem_util_pct", "pcie_tx_kbps", "pcie_rx_kbps", "power_mw"]
 
-    plot_tail_curve(outdir / "figures" / "tail_type_dir_p95.png",
-                    df, "settle_total_us",
-                    ["mode", "order", "transition_type", "dir_gpu", "dir_mem"],
-                    topk=min(args.topk, 24),
-                    title="Worst buckets by p95(settle_total_us): type + direction")
+    overall = {}
+    for c in key_latency_cols + metric_cols:
+        if c in df_use.columns:
+            overall[c] = basic_stats(df_use[c])
+    overall_df = pd.DataFrame(overall).T.reset_index().rename(columns={"index": "metric"})
+    overall_df.to_csv(out_dir / "summary_overall.csv", index=False)
 
-    plot_timeseries(outdir / "figures" / "timeseries_settle_total.png",
-                    df, "settle_total_us",
-                    "settle_total_us over time (drift / instability check)")
+    # per-transition
+    by_tr = []
+    if "transition" in df_use.columns and use_n > 0:
+        g = df_use.groupby("transition", dropna=False)
+        for tr, sub in g:
+            row = {"transition": tr, "n": int(sub.shape[0])}
+            for c in ["api_us", "settle_after_call_us", "settle_total_us", "polls", "gpu_util_pct", "pcie_tx_kbps", "pcie_rx_kbps", "power_mw"]:
+                if c in sub.columns:
+                    st = basic_stats(sub[c])
+                    # keep the most useful stats
+                    row.update({
+                        f"{c}_mean": st["mean"],
+                        f"{c}_p50": st["p50"],
+                        f"{c}_p95": st["p95"],
+                        f"{c}_p99": st["p99"],
+                        f"{c}_max": st["max"],
+                    })
+            by_tr.append(row)
 
-    plot_timeseries(outdir / "figures" / "timeseries_power_mw.png",
-                    df, "power_mw",
-                    "power_mw over time")
+    by_tr_df = pd.DataFrame(by_tr) if by_tr else pd.DataFrame()
 
-    print(f"[OK] Wrote report: {outdir/'report.md'}")
-    print(f"[OK] Wrote tables: {outdir/'summary_tables'}")
-    print(f"[OK] Wrote figures: {outdir/'figures'}")
+    if not by_tr_df.empty:
+        # prefer sort by settle_after_call_us_p99 if available; otherwise fallback
+        if "settle_after_call_us_p99" in by_tr_df.columns:
+            by_tr_df = by_tr_df.sort_values(
+                by=["n", "settle_after_call_us_p99"],
+                ascending=[False, False],
+            )
+        elif "settle_total_us_p99" in by_tr_df.columns:
+            by_tr_df = by_tr_df.sort_values(
+                by=["n", "settle_total_us_p99"],
+                ascending=[False, False],
+            )
+        elif "api_us_p99" in by_tr_df.columns:
+            by_tr_df = by_tr_df.sort_values(
+                by=["n", "api_us_p99"],
+                ascending=[False, False],
+            )
+        else:
+            by_tr_df = by_tr_df.sort_values(by=["n"], ascending=[False])
+    
+        by_tr_df.to_csv(out_dir / "summary_by_transition.csv", index=False)
 
+    # -------------------------
+    # Plots (each as standalone)
+    # -------------------------
+    if "settle_after_call_us" in df_use.columns:
+        plot_hist(df_use["settle_after_call_us"], "Settle latency (after set-call) histogram", "settle_after_call_us (us)",
+                  out_dir / "hist_settle_after_call_us.png", bins=80, clip_p99=True)
+        plot_cdf(df_use["settle_after_call_us"], "Settle latency (after set-call) CDF", "settle_after_call_us (us)",
+                 out_dir / "cdf_settle_after_call_us.png", clip_p999=True)
+
+    if "settle_total_us" in df_use.columns:
+        plot_hist(df_use["settle_total_us"], "Total latency (set + settle) histogram", "settle_total_us (us)",
+                  out_dir / "hist_settle_total_us.png", bins=80, clip_p99=True)
+        plot_cdf(df_use["settle_total_us"], "Total latency (set + settle) CDF", "settle_total_us (us)",
+                 out_dir / "cdf_settle_total_us.png", clip_p999=True)
+
+    if "api_us" in df_use.columns:
+        plot_hist(df_use["api_us"], "NVML set-call latency histogram", "api_us (us)",
+                  out_dir / "hist_api_us.png", bins=80, clip_p99=True)
+        plot_cdf(df_use["api_us"], "NVML set-call latency CDF", "api_us (us)",
+                 out_dir / "cdf_api_us.png", clip_p999=True)
+
+    # time series
+    if "t_s" in df_use.columns and "settle_after_call_us" in df_use.columns:
+        plot_timeseries(df_use["t_s"], df_use["settle_after_call_us"],
+                        "Settle latency over time", "settle_after_call_us (us)",
+                        out_dir / "ts_settle_after_call_us.png")
+
+    # box by transition (top N)
+    if "transition" in df_use.columns and "settle_after_call_us" in df_use.columns:
+        plot_box_by_group(df_use, "transition", "settle_after_call_us",
+                          "Settle latency by transition", out_dir / "box_settle_by_transition.png",
+                          max_groups=args.max_groups)
+
+    # scatter: load proxies vs settle
+    if "settle_after_call_us" in df_use.columns:
+        for xcol, label in [
+            ("gpu_util_pct", "gpu_util_pct (%)"),
+            ("mem_util_pct", "mem_util_pct (%)"),
+            ("pcie_tx_kbps", "pcie_tx_kbps"),
+            ("pcie_rx_kbps", "pcie_rx_kbps"),
+            ("power_mw", "power_mw"),
+        ]:
+            if xcol in df_use.columns:
+                plot_scatter(df_use[xcol], df_use["settle_after_call_us"],
+                             f"Settle latency vs {xcol}", label, "settle_after_call_us (us)",
+                             out_dir / f"scatter_settle_vs_{xcol}.png")
+
+    # correlations
+    corr_cols = []
+    for c in ["settle_after_call_us", "api_us"] + metric_cols:
+        if c in df_use.columns:
+            corr_cols.append(c)
+    corr = corr_spearman(df_use, corr_cols) if len(corr_cols) >= 3 else None
+    if corr is not None:
+        corr.to_csv(out_dir / "corr_spearman.csv")
+
+        # heatmap-ish via imshow (no seaborn)
+        plt.figure(figsize=(max(6, 0.6*len(corr_cols)), max(5, 0.6*len(corr_cols))))
+        plt.imshow(corr.values, vmin=-1, vmax=1)
+        plt.xticks(range(len(corr_cols)), corr_cols, rotation=45, ha="right")
+        plt.yticks(range(len(corr_cols)), corr_cols)
+        plt.colorbar()
+        plt.title("Spearman correlation")
+        save_fig(out_dir / "corr_spearman.png")
+
+    # -------------------------
+    # Markdown report
+    # -------------------------
+    report_lines = []
+    report_lines.append(f"# DVFS CSV Report\n")
+    report_lines.append(f"- input: `{csv_path}`")
+    report_lines.append(f"- rows: total={total_n}, analyzed={use_n} (ok_only={args.ok_only})\n")
+
+    if len(modes) > 0:
+        report_lines.append("## Modes")
+        for k, v in modes.items():
+            report_lines.append(f"- {k}: {int(v)}")
+        report_lines.append("")
+
+    if len(api_kinds) > 0:
+        report_lines.append("## API kinds")
+        for k, v in api_kinds.items():
+            report_lines.append(f"- {k}: {int(v)}")
+        report_lines.append("")
+
+    if len(status_counts) > 0:
+        report_lines.append("## Status breakdown (all rows)")
+        for k, v in status_counts.items():
+            report_lines.append(f"- {k}: {int(v)}")
+        report_lines.append("")
+
+    def fmt_us(x):
+        if x is None or (isinstance(x, float) and (math.isnan(x))):
+            return "NA"
+        return f"{x/1000.0:.3f} ms" if x >= 1000 else f"{x:.1f} us"
+
+    report_lines.append("## Overall latency stats (analyzed rows)")
+    for metric in ["api_us", "settle_after_call_us", "settle_total_us"]:
+        if metric in overall:
+            st = overall[metric]
+            report_lines.append(f"- **{metric}**: n={st['n']}, "
+                               f"p50={fmt_us(st['p50'])}, p90={fmt_us(st['p90'])}, p95={fmt_us(st['p95'])}, p99={fmt_us(st['p99'])}, max={fmt_us(st['max'])}")
+    report_lines.append("")
+
+    # slow transitions
+    if not by_tr_df.empty and "settle_after_call_us_p99" in by_tr_df.columns:
+        topk = by_tr_df.sort_values("settle_after_call_us_p99", ascending=False).head(10)
+        report_lines.append("## Slowest transitions (by settle_after_call_us p99)")
+        for _, r in topk.iterrows():
+            report_lines.append(
+                f"- {r['transition']} (n={int(r['n'])}): "
+                f"p50={fmt_us(r.get('settle_after_call_us_p50', np.nan))}, "
+                f"p95={fmt_us(r.get('settle_after_call_us_p95', np.nan))}, "
+                f"p99={fmt_us(r.get('settle_after_call_us_p99', np.nan))}, "
+                f"max={fmt_us(r.get('settle_after_call_us_max', np.nan))}"
+            )
+        report_lines.append("")
+
+    # load proxy quick read
+    report_lines.append("## Load proxies (interpretation tips)")
+    report_lines.append("- `gpu_util_pct`/`mem_util_pct`：NVML 的利用率采样，适合做粗粒度相关性。")
+    report_lines.append("- `pcie_tx_kbps`/`pcie_rx_kbps`：更像‘是否有 PCIe 活动’，对 comm 模式/host copies 有意义。")
+    report_lines.append("- `power_mw`：是最稳的“负载强度代理变量”（尤其 compute）。\n")
+
+    report_lines.append("## Files generated")
+    report_lines.append("- `summary_overall.csv`")
+    report_lines.append("- `summary_by_transition.csv`")
+    report_lines.append("- `corr_spearman.csv` (if enough data)")
+    report_lines.append("- `*.png` plots\n")
+
+    (out_dir / "report.md").write_text("\n".join(report_lines), encoding="utf-8")
+
+    print(f"[OK] Wrote outputs to: {out_dir.resolve()}")
+    print(f" - report.md")
+    print(f" - summary_overall.csv")
+    print(f" - summary_by_transition.csv")
+    if (out_dir / "corr_spearman.csv").exists():
+        print(f" - corr_spearman.csv + corr_spearman.png")
+    print(f" - png plots")
 
 if __name__ == "__main__":
     main()

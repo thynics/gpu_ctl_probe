@@ -1,0 +1,7 @@
+type,workload,status,count
+comm,high,ok(locked),3000
+comm,low,ok(locked),3000
+comm,mid,ok(locked),3950
+compute,high,ok(locked),3000
+compute,low,ok(locked),3000
+compute,mid,ok(locked),3000

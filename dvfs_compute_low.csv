@@ -1,3 +1,4 @@
+ts_us,device_id,gpu_name,mode,api_kind,mem_fixed_mhz,from_gpu_mhz,to_gpu_mhz,api_us,settle_total_us,settle_after_call_us,polls,stable_n,poll_us,timeout_ms,final_gpu_mhz,gpu_util_pct,mem_util_pct,pcie_tx_kbps,pcie_rx_kbps,power_mw,energy_mj,status
 9499549228,0,"Tesla V100-SXM2-32GB",compute,locked,877,135,412,7180,31769,24587,10,10,2000,8000,412,100,0,50,50,31272,232420444,ok(locked)
 9499859812,0,"Tesla V100-SXM2-32GB",compute,locked,877,135,412,3250,23450,20199,10,10,2000,8000,412,100,0,75,50,31272,232429187,ok(locked)
 9500157175,0,"Tesla V100-SXM2-32GB",compute,locked,877,135,412,3306,24492,21184,10,10,2000,8000,412,100,0,50,50,31272,232437561,ok(locked)
